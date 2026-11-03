@@ -1,0 +1,103 @@
+# Orquestador del pipeline de seguridad (laboratorio).
+# NO contiene lógica de escáneres: detecta lenguajes, invoca módulos y llama al gate.
+# Solo el job security-gate puede hacer fallar el pipeline.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"            # 01:00 hora Colombia (UTC-5) — Gitleaks con historial completo
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: 'auto | lista exacta "python,go" | ajustes "+go,-node"'
+        required: false
+        default: auto
+
+permissions:
+  contents: read
+  pull-requests: write             # comentario del gate en el PR (fase siguiente)
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.langs.outputs.python }}
+      go: ${{ steps.langs.outputs.go }}
+      node: ${{ steps.langs.outputs.node }}
+      markers: ${{ steps.langs.outputs.markers }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - id: langs
+        uses: ./.github/actions/detect-languages
+        with:
+          languages: ${{ inputs.languages || 'auto' }}
+
+  scan-common:                     # SIEMPRE; no depende de detect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true        # un escáner nunca tumba el pipeline
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0           # Gitleaks necesita historial (BASE..HEAD o completo)
+          persist-credentials: false
+      - uses: ./.github/actions/scan-common
+
+  scan-python:
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/scan-python
+
+  # scan-go / scan-node: siguiente fase (mismo patrón, if: needs.detect.outputs.<lang> == 'true')
+
+  security-gate:
+    # PROVISIONAL: solo muestra el estado de los escáneres; NO bloquea.
+    # Se reemplaza por ./.github/actions/security-gate en la fase siguiente.
+    needs: [detect, scan-common, scan-python]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SECURITY_GATE_MODE: ${{ vars.SECURITY_GATE_MODE || 'enforce' }}
+      MARKERS: ${{ needs.detect.outputs.markers }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: scan-*
+          path: reports
+      - name: Estado de escáneres (provisional)
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os, pathlib
+          print("## Security gate (provisional — no bloquea)")
+          print(f"Modo: `{os.environ['SECURITY_GATE_MODE']}` · Lenguajes: {os.environ.get('MARKERS') or 'ninguno'}")
+          print()
+          print("| Módulo | Herramienta | Estado | Exit | Detalle |")
+          print("|---|---|---|---|---|")
+          files = sorted(pathlib.Path("reports").glob("*/status.json"))
+          for f in files:
+              d = json.loads(f.read_text(encoding="utf-8"))
+              for t in d["herramientas"]:
+                  det = t["detalle"].replace("|", "/").replace("\n", " ")[:120]
+                  print(f"| {d['modulo']} | {t['herramienta']} | {t['estado']} | {t['exit_code']} | {det} |")
+          if not files:
+              print("| — | — | sin reportes | — | ningún módulo subió status.json |")
+          PY

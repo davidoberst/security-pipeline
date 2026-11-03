@@ -1,0 +1,168 @@
+name: scan-common
+description: >
+  Escáneres comunes a todo repo: Gitleaks (secretos), Trivy fs (CVE de
+  dependencias + Dockerfile) y Semgrep (SAST con ruleset local versionado).
+  Solo produce JSON + status.json; NUNCA falla (la decisión es del gate).
+
+inputs:
+  artifact-name:
+    description: Nombre del artifact con los reportes.
+    required: false
+    default: scan-common
+  python-version:
+    description: Python para instalar Semgrep.
+    required: false
+    default: "3.12"
+  gitleaks-version:
+    required: false
+    default: "8.30.1"
+  trivy-version:
+    required: false
+    default: "0.76.0"
+  semgrep-version:
+    required: false
+    default: "1.181.0"
+
+runs:
+  using: composite
+  steps:
+    # Reportes FUERA del workspace: ningún escáner lee el reporte de otro.
+    - id: prep
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/security-reports/common"
+        mkdir -p "$dir" "$RUNNER_TEMP/bin"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Instalar herramientas (versiones fijas, checksum verificado)
+      shell: bash
+      env:
+        GL_VER: ${{ inputs.gitleaks-version }}
+        TV_VER: ${{ inputs.trivy-version }}
+        SG_VER: ${{ inputs.semgrep-version }}
+      run: |
+        cd "$RUNNER_TEMP"
+        # install_tar <nombre> <url-tarball> <url-checksums> <binario>
+        install_tar() {
+          local f; f=$(basename "$2")
+          curl -sSfLO "$2" \
+            && curl -sSfL "$3" -o "$1.sums" \
+            && grep " ${f}\$" "$1.sums" | sha256sum -c - \
+            && tar -xzf "$f" -C bin "$4"
+        }
+        GL=https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}
+        TV=https://github.com/aquasecurity/trivy/releases/download/v${TV_VER}
+        install_tar gitleaks "$GL/gitleaks_${GL_VER}_linux_x64.tar.gz" "$GL/gitleaks_${GL_VER}_checksums.txt" gitleaks \
+          || echo "::warning title=scan-common::no se pudo instalar Gitleaks ${GL_VER}"
+        install_tar trivy "$TV/trivy_${TV_VER}_Linux-64bit.tar.gz" "$TV/trivy_${TV_VER}_checksums.txt" trivy \
+          || echo "::warning title=scan-common::no se pudo instalar Trivy ${TV_VER}"
+        python -m pip install --quiet --disable-pip-version-check "semgrep==${SG_VER}" \
+          || echo "::warning title=scan-common::no se pudo instalar Semgrep ${SG_VER}"
+        exit 0
+
+    - name: Gitleaks
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        CFG: ${{ github.action_path }}/gitleaks.toml
+        EVENT: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        BEFORE: ${{ github.event.before }}
+        SHA: ${{ github.sha }}
+      run: |
+        case "$EVENT" in
+          pull_request)
+            opts=(--log-opts="origin/${BASE_REF}..HEAD") ;;
+          push)
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then opts=()   # rama nueva → historial completo
+            else opts=(--log-opts="${BEFORE}..${SHA}"); fi ;;
+          *)
+            opts=() ;;                                                 # schedule / workflow_dispatch → historial completo
+        esac
+        echo "Gitleaks · evento=$EVENT · rango=${opts[*]:-historial completo}"
+        set +e
+        gitleaks git . "${opts[@]}" --config "$CFG" --redact --no-banner \
+          --report-format json --report-path "$OUT/gitleaks.json" --exit-code 0 \
+          2> "$OUT/gitleaks.stderr.log"
+        echo $? > "$OUT/gitleaks.exit"
+        exit 0
+
+    - name: Trivy fs
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        set +e
+        trivy fs . --scanners vuln,misconfig --format json --output "$OUT/trivy.json" \
+          --exit-code 0 --no-progress --cache-dir "$RUNNER_TEMP/trivy-cache" \
+          2> "$OUT/trivy.stderr.log"
+        echo $? > "$OUT/trivy.exit"
+        exit 0
+
+    - name: Semgrep (ruleset local versionado)
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        RULES: ${{ github.action_path }}/semgrep-rules
+      run: |
+        set +e
+        semgrep scan --config "$RULES" --json --output "$OUT/semgrep.json" \
+          --metrics=off --disable-version-check . \
+          2> "$OUT/semgrep.stderr.log"
+        echo $? > "$OUT/semgrep.exit"
+        exit 0
+
+    # status.json: ok = JSON válido (aunque exit != 0); error = sin JSON / JSON inválido.
+    - name: status.json
+      if: always()
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        python3 - "$OUT" scan-common <<'PY'
+        import json, sys, pathlib
+        out, modulo = pathlib.Path(sys.argv[1]), sys.argv[2]
+        tools = []
+        for ex in sorted(out.glob("*.exit")):
+            name = ex.stem
+            code = ex.read_text().strip()
+            rep = out / f"{name}.json"
+            log = out / f"{name}.stderr.log"
+            if code == "skip":
+                estado = "omitido"
+                detalle = log.read_text(errors="replace").strip() if log.exists() else ""
+            else:
+                try:
+                    json.loads(rep.read_text(encoding="utf-8"))
+                    estado, detalle = "ok", ""
+                except FileNotFoundError:
+                    estado, detalle = "error", "la herramienta no generó su JSON"
+                except (ValueError, UnicodeDecodeError) as e:
+                    estado, detalle = "error", f"JSON inválido: {e}"
+                if estado == "error" and log.exists():
+                    detalle += " | " + log.read_text(errors="replace").strip()[-400:]
+            tools.append({"herramienta": name, "exit_code": code, "estado": estado,
+                          "detalle": detalle, "reporte": rep.name})
+        (out / "status.json").write_text(
+            json.dumps({"modulo": modulo, "herramientas": tools}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        for t in tools:
+            mark = "✓" if t["estado"] == "ok" else t["estado"].upper()
+            print(f"  {t['herramienta']:<10} {mark}  (exit {t['exit_code']})")
+            if t["estado"] == "error":
+                msg = t["detalle"].replace("\n", " ")[:200]
+                print(f"::warning title={modulo}/{t['herramienta']}::ERROR de herramienta (no bloquea): {msg}")
+        PY
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.prep.outputs.dir }}
+        retention-days: 14
+        if-no-files-found: warn

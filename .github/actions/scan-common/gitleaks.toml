@@ -1,0 +1,13 @@
+# Config de Gitleaks del laboratorio: reglas oficiales + una regla para el
+# formato de key INVENTADO "ALOLAB_" (no corresponde a ningún proveedor real).
+title = "security-pipeline-lab"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "alolab-fake-api-key"
+description = "API key FICTICIA del laboratorio (formato ALOLAB_...)"
+regex = '''ALOLAB_[A-Z0-9]{32}'''
+keywords = ["alolab_"]
+tags = ["lab", "ficticio"]

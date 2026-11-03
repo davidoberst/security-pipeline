@@ -1,0 +1,111 @@
+name: detect-languages
+description: >
+  Detecta los lenguajes del repo por ARCHIVOS MARCADORES (no por extensión).
+  Python = requirements.txt / pyproject.toml / Pipfile · Go = go.mod ·
+  Node (JS backend) = package.json cuyo directorio NO tiene tsconfig.json.
+
+inputs:
+  languages:
+    description: >
+      "auto" (default) = detección automática.
+      Lista exacta sin prefijos ("python,go") = solo esos lenguajes.
+      Ajustes con prefijo ("+go,-node") = se aplican sobre lo detectado.
+    required: false
+    default: auto
+  path:
+    description: Raíz a inspeccionar.
+    required: false
+    default: .
+
+outputs:
+  python:
+    description: "true / false"
+    value: ${{ steps.detect.outputs.python }}
+  go:
+    description: "true / false"
+    value: ${{ steps.detect.outputs.go }}
+  node:
+    description: "true / false"
+    value: ${{ steps.detect.outputs.node }}
+  markers:
+    description: 'Texto legible, p. ej. "python (samples/python/requirements.txt)"'
+    value: ${{ steps.detect.outputs.markers }}
+
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        INPUT_LANGUAGES: ${{ inputs.languages }}
+        INPUT_PATH: ${{ inputs.path }}
+      run: |
+        set -uo pipefail
+        cd "$INPUT_PATH"
+
+        # Busca archivos por nombre, ignorando directorios de dependencias/VCS.
+        find_markers() {
+          find . \( -path ./.git -o -name node_modules -o -name .venv -o -name venv -o -name vendor \) -prune \
+                 -o -type f \( "$@" \) -print | sed 's|^\./||' | sort
+        }
+
+        py=$(find_markers -name requirements.txt -o -name pyproject.toml -o -name Pipfile)
+        go=$(find_markers -name go.mod)
+        node=""
+        while IFS= read -r pkg; do
+          if [ -n "$pkg" ] && [ ! -f "$(dirname "$pkg")/tsconfig.json" ]; then
+            node+="$pkg"$'\n'
+          fi
+        done <<< "$(find_markers -name package.json)"
+        node=$(printf '%s' "$node" | sed '/^$/d')
+
+        declare -A on=( [python]=false [go]=false [node]=false )
+        declare -A mk=( [python]="$py" [go]="$go" [node]="$node" )
+        for l in python go node; do
+          if [ -n "${mk[$l]}" ]; then on[$l]=true; fi
+        done
+
+        # Overrides manuales (input "languages").
+        raw=$(echo "${INPUT_LANGUAGES:-auto}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$raw" ] && [ "$raw" != auto ]; then
+          IFS=',' read -ra toks <<< "$raw"
+          # Si hay algún token sin prefijo → modo exacto: se parte de todo apagado.
+          for t in "${toks[@]}"; do
+            case "$t" in
+              ""|+*|-*) ;;
+              *) for l in python go node; do on[$l]=false; done; break ;;
+            esac
+          done
+          for t in "${toks[@]}"; do
+            case "$t" in
+              "") continue ;;
+              +*) l=${t#+}; v=true ;;
+              -*) l=${t#-}; v=false ;;
+              *)  l=$t;     v=true ;;
+            esac
+            case "$l" in
+              python|go|node)
+                on[$l]=$v
+                if [ -z "${mk[$l]}" ]; then mk[$l]="forzado manual"; fi
+                ;;
+              *) echo "::warning title=detect-languages::lenguaje desconocido '$l' en 'languages' (ignorado)" ;;
+            esac
+          done
+        fi
+
+        markers=""
+        for l in python go node; do
+          if [ "${on[$l]}" = true ]; then
+            markers+="${markers:+; }$l ($(printf '%s\n' "${mk[$l]}" | paste -sd ',' -))"
+          fi
+        done
+
+        {
+          echo "python=${on[python]}"
+          echo "go=${on[go]}"
+          echo "node=${on[node]}"
+          echo "markers=${markers:-ninguno}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Detectado  → python=${on[python]}  go=${on[go]}  node=${on[node]}"
+        echo "Marcadores → ${markers:-ninguno}"

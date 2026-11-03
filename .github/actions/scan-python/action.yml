@@ -1,0 +1,142 @@
+name: scan-python
+description: >
+  Escáneres Python: Bandit (SAST seguridad), pip-audit (CVE de dependencias)
+  y Ruff (lógica / calidad). Solo produce JSON + status.json; NUNCA falla.
+
+inputs:
+  artifact-name:
+    description: Nombre del artifact con los reportes.
+    required: false
+    default: scan-python
+  python-version:
+    required: false
+    default: "3.12"
+  bandit-version:
+    required: false
+    default: "1.9.4"
+  pip-audit-version:
+    required: false
+    default: "2.10.1"
+  ruff-version:
+    required: false
+    default: "0.17.1"
+
+runs:
+  using: composite
+  steps:
+    - id: prep
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/security-reports/python"
+        mkdir -p "$dir"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Instalar herramientas (versiones fijas)
+      shell: bash
+      env:
+        BANDIT_VER: ${{ inputs.bandit-version }}
+        PIPAUDIT_VER: ${{ inputs.pip-audit-version }}
+        RUFF_VER: ${{ inputs.ruff-version }}
+      run: |
+        python -m pip install --quiet --disable-pip-version-check \
+          "bandit==${BANDIT_VER}" "pip-audit==${PIPAUDIT_VER}" "ruff==${RUFF_VER}" \
+          || echo "::warning title=scan-python::fallo instalando herramientas"
+        exit 0
+
+    - name: Bandit
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        set +e
+        bandit -r . -f json -o "$OUT/bandit.json" --exit-zero \
+          -x ./.git,./.venv,./venv,./node_modules \
+          2> "$OUT/bandit.stderr.log"
+        echo $? > "$OUT/bandit.exit"
+        exit 0
+
+    - name: pip-audit
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        mapfile -t reqs < <(find . \( -path ./.git -o -name .venv -o -name venv -o -name node_modules \) -prune \
+                                 -o -type f -name 'requirements*.txt' -print)
+        if [ ${#reqs[@]} -eq 0 ]; then
+          echo "sin archivos requirements*.txt" > "$OUT/pip-audit.stderr.log"
+          echo skip > "$OUT/pip-audit.exit"
+          exit 0
+        fi
+        args=(); for r in "${reqs[@]}"; do args+=(-r "$r"); done
+        echo "pip-audit sobre: ${reqs[*]}"
+        set +e
+        # --no-deps --disable-pip: no instala nada; audita las versiones fijadas.
+        pip-audit "${args[@]}" --no-deps --disable-pip -f json -o "$OUT/pip-audit.json" \
+          2> "$OUT/pip-audit.stderr.log"
+        echo $? > "$OUT/pip-audit.exit"   # exit 1 = encontró CVEs (si el JSON es válido → ok)
+        exit 0
+
+    - name: Ruff
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        set +e
+        ruff check . --output-format json --output-file "$OUT/ruff.json" --exit-zero --no-cache \
+          2> "$OUT/ruff.stderr.log"
+        echo $? > "$OUT/ruff.exit"
+        exit 0
+
+    # status.json: mismo contrato que scan-common.
+    - name: status.json
+      if: always()
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        python3 - "$OUT" scan-python <<'PY'
+        import json, sys, pathlib
+        out, modulo = pathlib.Path(sys.argv[1]), sys.argv[2]
+        tools = []
+        for ex in sorted(out.glob("*.exit")):
+            name = ex.stem
+            code = ex.read_text().strip()
+            rep = out / f"{name}.json"
+            log = out / f"{name}.stderr.log"
+            if code == "skip":
+                estado = "omitido"
+                detalle = log.read_text(errors="replace").strip() if log.exists() else ""
+            else:
+                try:
+                    json.loads(rep.read_text(encoding="utf-8"))
+                    estado, detalle = "ok", ""
+                except FileNotFoundError:
+                    estado, detalle = "error", "la herramienta no generó su JSON"
+                except (ValueError, UnicodeDecodeError) as e:
+                    estado, detalle = "error", f"JSON inválido: {e}"
+                if estado == "error" and log.exists():
+                    detalle += " | " + log.read_text(errors="replace").strip()[-400:]
+            tools.append({"herramienta": name, "exit_code": code, "estado": estado,
+                          "detalle": detalle, "reporte": rep.name})
+        (out / "status.json").write_text(
+            json.dumps({"modulo": modulo, "herramientas": tools}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        for t in tools:
+            mark = "✓" if t["estado"] == "ok" else t["estado"].upper()
+            print(f"  {t['herramienta']:<10} {mark}  (exit {t['exit_code']})")
+            if t["estado"] == "error":
+                msg = t["detalle"].replace("\n", " ")[:200]
+                print(f"::warning title={modulo}/{t['herramienta']}::ERROR de herramienta (no bloquea): {msg}")
+        PY
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.prep.outputs.dir }}
+        retention-days: 14
+        if-no-files-found: warn

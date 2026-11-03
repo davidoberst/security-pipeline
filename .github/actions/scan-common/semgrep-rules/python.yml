@@ -1,0 +1,29 @@
+# Ruleset Semgrep FIJO y versionado en el repo (no se descarga del registro).
+rules:
+  - id: lab.python.sqli-string-building
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL construido con texto + datos externos y ejecutado directamente.
+      Usa consultas parametrizadas: cursor.execute("... WHERE x = ?", (valor,)).
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+    pattern-either:
+      - pattern: $C.execute("..." + $X, ...)
+      - pattern: $C.execute("..." + $X + "...", ...)
+      - pattern: $C.execute(f"...", ...)
+      - pattern: $C.execute("..." % $X, ...)
+      - pattern: $C.execute("...".format(...), ...)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $Q = "..." + $X
+                  ...
+              - pattern-inside: |
+                  $Q = "..." + $X + "..."
+                  ...
+              - pattern-inside: |
+                  $Q = f"..."
+                  ...
+          - pattern: $C.execute($Q, ...)
