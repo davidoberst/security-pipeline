@@ -1,0 +1,46 @@
+# Política del security gate (sección 5.2). Se ajusta aquí, sin tocar el workflow.
+
+# Acción por severidad (ya traducida a la escala común).
+# REGLA FIJA: solo CRITICAL y HIGH pueden bloquear. Si aquí se pone "bloquea"
+# en otra severidad, el gate lo ignora con un warning.
+acciones:
+  CRITICAL: bloquea
+  HIGH: bloquea
+  MEDIUM: avisa        # no bloquea · va a backlog
+  LOW: informa         # no bloquea
+  INFO: informa        # no bloquea
+
+# Solo bloquea lo NUEVO del PR. Un CRITICAL/HIGH preexistente avisa y va a backlog.
+solo_nuevos: true
+
+# Plazo en días para lo que va a backlog.
+sla_dias:
+  CRITICAL: 7          # deuda preexistente
+  HIGH: 15             # deuda preexistente
+  MEDIUM: 30
+
+# Traducción de la escala de cada herramienta a CRITICAL/HIGH/MEDIUM/LOW/INFO.
+# "_otro" = valor si la herramienta trae algo no listado.
+severidades:
+  gitleaks: CRITICAL   # no trae severidad: todo secreto es CRITICAL
+  trivy:
+    CRITICAL: CRITICAL
+    HIGH: HIGH
+    MEDIUM: MEDIUM
+    LOW: LOW
+    _otro: MEDIUM      # UNKNOWN
+  semgrep:
+    ERROR: HIGH
+    WARNING: MEDIUM
+    INFO: INFO
+    _otro: MEDIUM
+  bandit:
+    HIGH: HIGH
+    MEDIUM: MEDIUM
+    LOW: LOW
+    _otro: INFO        # UNDEFINED
+  pip-audit: MEDIUM    # no trae severidad: se usa la de Trivy para el mismo CVE; si Trivy no lo vio, este valor
+  ruff:
+    severidad: LOW                 # calidad
+    logica_severidad: MEDIUM       # reglas que indican un bug real
+    logica_prefijos: [F821, F822, F823, F632, E9, PLE]

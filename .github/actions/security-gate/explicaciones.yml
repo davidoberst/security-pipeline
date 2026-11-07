@@ -1,0 +1,94 @@
+# Textos de la CLI del gate. Búsqueda: 1) regla → 2) CWE → 3) clase genérica.
+# Variables disponibles: {paquete} {version} {fix} {mensaje} {regla} {archivo} {linea}
+
+reglas:
+  alolab-fake-api-key:
+    titulo: API key hardcodeada
+    subtipo: secreto
+    cwe: CWE-798
+    que_es: Una credencial está escrita en el código fuente y queda guardada en el historial de git.
+    riesgo: Cualquiera con acceso al repo, a un fork o a un clon puede usarla; borrarla del archivo no la saca del historial.
+    arreglo: Revoca y rota la key, guárdala como secreto (GitHub Secrets / vault) y léela con os.environ en ejecución.
+
+  lab.python.sqli-string-building:
+    titulo: SQL Injection
+    subtipo: inyección
+    cwe: CWE-89
+    que_es: La consulta SQL se arma concatenando texto con un valor externo y se ejecuta tal cual.
+    riesgo: Un atacante puede inyectar SQL (p. ej. ' OR '1'='1) para leer, modificar o borrar datos.
+    arreglo: 'Usa consultas parametrizadas: cursor.execute("SELECT ... WHERE nombre = ?", (nombre,)).'
+
+  B608:
+    titulo: Posible SQL Injection (query armado con strings)
+    subtipo: inyección
+    cwe: CWE-89
+    que_es: Bandit encontró una consulta SQL construida con operaciones de texto.
+    riesgo: Si alguna parte viene del usuario, permite inyectar SQL y leer o alterar datos.
+    arreglo: 'Usa consultas parametrizadas: cursor.execute("... WHERE x = ?", (valor,)).'
+
+  F841:
+    titulo: Variable asignada y nunca usada
+    categoria: calidad
+    subtipo: código muerto
+    que_es: "Se asigna un valor que nunca se usa ({mensaje})."
+    riesgo: Sin riesgo directo; a veces esconde un bug (un cálculo que se quería usar) y ensucia el código.
+    arreglo: Elimina la asignación o usa la variable donde corresponda.
+
+  DS002:
+    titulo: El contenedor corre como root
+    subtipo: configuración
+    cwe: CWE-250
+    que_es: El Dockerfile no define un USER distinto de root.
+    riesgo: Si la app se compromete, el atacante es root dentro del contenedor y le es más fácil escalar.
+    arreglo: Crea un usuario sin privilegios y agrega "USER <usuario>" al final del Dockerfile.
+
+cwe:
+  CWE-89:
+    subtipo: inyección
+    riesgo: Permite inyectar SQL y leer, modificar o borrar datos.
+    arreglo: Usa consultas parametrizadas; nunca concatenes input en el SQL.
+  CWE-78:
+    subtipo: inyección de comandos
+    riesgo: Permite ejecutar comandos arbitrarios en el servidor.
+    arreglo: No pases input a una shell; usa listas de argumentos fijas y valida contra una lista permitida.
+  CWE-95:
+    subtipo: inyección de código
+    riesgo: Permite ejecutar código arbitrario dentro del proceso.
+    arreglo: Elimina eval/exec sobre datos externos; usa un parser seguro (p. ej. json).
+  CWE-798:
+    subtipo: secreto
+    riesgo: La credencial puede ser usada por cualquiera con acceso al código o a su historial.
+    arreglo: Revoca y rota la credencial, y muévela a un gestor de secretos.
+
+genericos:
+  secreto:
+    subtipo: secreto
+    que_es: "Posible secreto en el código: {mensaje}."
+    riesgo: Una credencial en el repo puede ser usada por cualquiera con acceso al código o a su historial.
+    arreglo: Revoca y rota la credencial, y muévela a un gestor de secretos.
+  cve:
+    subtipo: dependencia
+    que_es: "{paquete} {version} tiene una vulnerabilidad pública conocida: {mensaje}"
+    riesgo: Las vulnerabilidades publicadas suelen tener exploits disponibles y afectan a todo lo que usa esa librería.
+    arreglo: "Actualiza {paquete} a una versión corregida ({fix}) y fíjala en el archivo de dependencias."
+    arreglo_sin_fix: "Aún no hay versión corregida de {paquete}: evalúa reemplazarla o mitigar el uso afectado y vigila el parche."
+  config:
+    subtipo: configuración
+    que_es: "{mensaje}"
+    riesgo: Una configuración insegura facilita el ataque o amplía su impacto.
+    arreglo: "{fix}"
+  sast:
+    subtipo: código
+    que_es: "{mensaje}"
+    riesgo: El análisis estático señala un patrón de código que suele ser explotable.
+    arreglo: "Revisa la regla {regla} en la documentación de la herramienta y corrige el patrón."
+  logica:
+    subtipo: bug
+    que_es: "{mensaje}"
+    riesgo: Puede causar un fallo en ejecución o un comportamiento inesperado.
+    arreglo: "Corrige el código según la regla {regla}."
+  calidad:
+    subtipo: code smell
+    que_es: "{mensaje}"
+    riesgo: Sin riesgo directo; dificulta mantener el código.
+    arreglo: "Corrige según la regla {regla}."

@@ -1,0 +1,148 @@
+name: security-gate
+description: >
+  Lee los JSON de los módulos scan-*, normaliza cada hallazgo, aplica
+  gate-config/policy.yml y decide. Es la ÚNICA pieza que puede hacer fallar el
+  pipeline, y solo por hallazgos CRITICAL/HIGH nuevos. MEDIUM/LOW/INFO se informan.
+
+inputs:
+  mode:
+    description: "enforce | report | off"
+    required: false
+    default: enforce
+  policy:
+    description: Ruta a la política.
+    required: false
+    default: gate-config/policy.yml
+  markers:
+    description: Salida "markers" de detect-languages.
+    required: false
+    default: ""
+  expected-modules:
+    description: Módulos que debían correr, separados por espacio.
+    required: false
+    default: scan-common
+  treat-all-as-new:
+    description: "Solo laboratorio: 'true' trata todo hallazgo como nuevo."
+    required: false
+    default: "false"
+  github-token:
+    description: Token para comentar en el PR.
+    required: false
+    default: ${{ github.token }}
+  python-version:
+    required: false
+    default: "3.12"
+  pyyaml-version:
+    required: false
+    default: "6.0.3"
+
+outputs:
+  resultado:
+    description: "bloqueado | aprobado | report | off"
+    value: ${{ steps.gate.outputs.resultado }}
+  bloquean:
+    description: Número de hallazgos que bloquean.
+    value: ${{ steps.gate.outputs.bloquean }}
+
+runs:
+  using: composite
+  steps:
+    - id: prep
+      shell: bash
+      run: |
+        base="$RUNNER_TEMP/security-gate"
+        mkdir -p "$base/reports" "$base/out"
+        echo "reports=$base/reports" >> "$GITHUB_OUTPUT"
+        echo "out=$base/out" >> "$GITHUB_OUTPUT"
+
+    - name: Descargar reportes de los escáneres
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      continue-on-error: true        # sin artifacts → la CLI muestra "sin reporte"
+      with:
+        pattern: scan-*
+        path: ${{ steps.prep.outputs.reports }}
+
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Instalar dependencias del gate (versión fija)
+      shell: bash
+      env:
+        PYYAML_VER: ${{ inputs.pyyaml-version }}
+      run: python -m pip install --quiet --disable-pip-version-check "pyyaml==${PYYAML_VER}"
+
+    - name: Evaluar (CLI en el log + summary de la corrida)
+      id: gate
+      shell: bash
+      env:
+        GATE_PY: ${{ github.action_path }}/gate.py
+        REPORTS_DIR: ${{ steps.prep.outputs.reports }}
+        OUT_DIR: ${{ steps.prep.outputs.out }}
+        POLICY: ${{ inputs.policy }}
+        MODE: ${{ inputs.mode }}
+        MARKERS: ${{ inputs.markers }}
+        EXPECTED_MODULES: ${{ inputs.expected-modules }}
+        TREAT_ALL_AS_NEW: ${{ inputs.treat-all-as-new }}
+        EVENT: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        BASE_REF: ${{ github.base_ref }}
+        REF_NAME: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        PYTHONIOENCODING: utf-8
+      run: |
+        python "$GATE_PY"
+        cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comentario en el PR (uno solo, se actualiza en cada corrida)
+      if: github.event_name == 'pull_request' && steps.gate.outputs.resultado != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        OUT_DIR: ${{ steps.prep.outputs.out }}
+      run: |
+        python -c 'import json,sys; print(json.dumps({"body": open(sys.argv[1], encoding="utf-8").read()}))' \
+          "$OUT_DIR/comment.md" > "$OUT_DIR/comment.json"
+        id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- security-gate-lab -->"))) | .id' \
+              2>/dev/null | head -n 1 || true)
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$id" --input "$OUT_DIR/comment.json" > /dev/null \
+            && echo "Comentario del PR actualizado (#$id)" \
+            || echo "::warning title=security-gate::no se pudo actualizar el comentario del PR (la decisión no cambia)"
+        else
+          gh api -X POST "repos/$REPO/issues/$PR/comments" --input "$OUT_DIR/comment.json" > /dev/null \
+            && echo "Comentario creado en el PR #$PR" \
+            || echo "::warning title=security-gate::no se pudo comentar en el PR (la decisión no cambia)"
+        fi
+
+    - name: Respaldo (hallazgos normalizados)
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      continue-on-error: true
+      with:
+        name: security-gate-report
+        path: ${{ steps.prep.outputs.out }}
+        retention-days: 14
+        if-no-files-found: warn
+
+    - name: Decisión
+      if: always()
+      shell: bash
+      env:
+        RESULTADO: ${{ steps.gate.outputs.resultado }}
+        BLOQUEAN: ${{ steps.gate.outputs.bloquean }}
+      run: |
+        case "$RESULTADO" in
+          bloqueado)
+            echo "::error title=Security gate::BLOQUEADO — $BLOQUEAN hallazgo(s) CRITICAL/HIGH nuevos. Detalle en este log, en el summary y en el comentario del PR."
+            exit 1 ;;
+          aprobado|report|off)
+            echo "Security gate: $RESULTADO" ;;
+          *)
+            echo "::error title=Security gate::el gate no pudo evaluar (error interno, ver pasos anteriores). No se aprueba a ciegas."
+            exit 1 ;;
+        esac
