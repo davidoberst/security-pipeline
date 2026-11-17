@@ -1,0 +1,8 @@
+# Cambios al pipeline de seguridad, su política y sus excepciones requieren
+# aprobación de seguridad. Solo es efectivo si la protección de rama de main
+# tiene activo "Require review from Code Owners".
+.github/workflows/         @davidoberst
+.github/actions/           @davidoberst
+gate-config/               @davidoberst
+.security-exceptions.yml   @davidoberst
+CODEOWNERS                 @davidoberst

@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import textwrap
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -34,7 +35,9 @@ MARCA_COMENTARIO = "<!-- security-gate-lab -->"
 LIMITE_COMENTARIO = 60000            # GitHub admite ~65k caracteres por comentario
 CAMPOS_SALIDA = ["herramienta", "herramientas", "regla", "categoria", "subtipo", "severidad",
                  "severidad_estimada", "archivo", "linea", "cwe", "titulo", "que_es", "riesgo",
-                 "arreglo", "nuevo", "commit", "accion", "bloquea", "sla", "paquete", "version", "fix"]
+                 "arreglo", "nuevo", "commit", "accion", "bloquea", "sla", "paquete", "version", "fix",
+                 "excepcion", "excepcion_vencida"]
+TIPOS_EXCEPCION = ("falso_positivo", "riesgo_aceptado")
 
 
 def env(nombre, defecto=""):
@@ -184,6 +187,103 @@ def decidir(h, pol):
     h["sla"] = (pol.get("sla_dias") or {}).get(sev) if accion == "avisa" else None
 
 
+# ── Excepciones (.security-exceptions.yml) ────────────────────────────────
+def _fecha(valor):
+    if isinstance(valor, datetime):
+        return valor.date()
+    if isinstance(valor, date):                  # YAML ya convierte 2026-11-17 en date
+        return valor
+    try:
+        return date.fromisoformat(str(valor).strip())
+    except ValueError:
+        return None
+
+
+def cargar_excepciones(ruta, hoy=None):
+    """(vigentes, vencidas). Sin archivo → sin excepciones. Una entrada inválida se
+    ignora con un warning y NO exceptúa nada."""
+    hoy = hoy or datetime.now(timezone.utc).date()
+    p = Path(ruta)
+    if not p.is_file():
+        return [], []
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        aviso(f"{ruta} ilegible ({e}); no se aplica ninguna excepción")
+        return [], []
+    entradas = data.get("exceptions") if isinstance(data, dict) else None
+    if not isinstance(entradas, list):
+        if entradas is not None or not isinstance(data, dict):
+            aviso(f"{ruta}: se esperaba una lista 'exceptions:'; no se aplica ninguna excepción")
+        return [], []
+
+    vigentes, vencidas = [], []
+    for i, e in enumerate(entradas, 1):
+        if not isinstance(e, dict):
+            aviso(f"excepción #{i} de {ruta} inválida: no es un objeto → se ignora")
+            continue
+        eid = str(e.get("id") or f"#{i}").strip()
+
+        def vacio(k):
+            return e.get(k) is None or str(e.get(k)).strip() == ""
+
+        problemas = [f"falta '{k}'" for k in ("regla", "archivo", "razon", "vence") if vacio(k)]
+        archivo = "" if vacio("archivo") else N.ruta_relativa(str(e["archivo"]).strip())
+        if not vacio("archivo") and (archivo in ("", ".", "/") or any(c in archivo for c in "*?[")):
+            problemas.append(f"'archivo' debe ser una ruta exacta, sin comodines: {e['archivo']}")
+        vence = None if vacio("vence") else _fecha(e["vence"])
+        if not vacio("vence") and vence is None:
+            problemas.append(f"'vence' no es una fecha ISO (AAAA-MM-DD): {e['vence']}")
+        linea = None
+        if not vacio("linea"):
+            try:
+                linea = int(e["linea"])
+            except (TypeError, ValueError):
+                problemas.append(f"'linea' no es un número: {e['linea']}")
+        tipo = "" if vacio("tipo") else str(e["tipo"]).strip()
+        if tipo and tipo not in TIPOS_EXCEPCION:
+            problemas.append(f"'tipo' debe ser {' o '.join(TIPOS_EXCEPCION)}: {tipo}")
+        if problemas:
+            aviso(f"excepción {eid} inválida ({'; '.join(problemas)}) → se ignora, no exceptúa nada")
+            continue
+
+        ex = {"id": eid, "regla": str(e["regla"]).strip(), "archivo": archivo, "linea": linea,
+              "razon": " ".join(str(e["razon"]).split()), "vence": vence.isoformat(),
+              "aprobado_por": "" if vacio("aprobado_por") else str(e["aprobado_por"]).strip(), "tipo": tipo}
+        if vence < hoy:
+            aviso(f"excepción {eid} VENCIÓ el {ex['vence']} → ya no aplica y el hallazgo vuelve a bloquear. "
+                  "Renuévala (con aprobación de seguridad) o corrige el hallazgo")
+            vencidas.append(ex)
+        else:
+            vigentes.append(ex)
+    return vigentes, vencidas
+
+
+def _coincide(ex, h):
+    if ex["regla"] != h["regla"] and ex["regla"] not in (h.get("ids") or ()):
+        return False
+    if ex["archivo"] != h["archivo"]:
+        return False
+    if ex["linea"] is None:                      # sin línea: todo el archivo (nunca todo el repo)
+        return True
+    try:
+        return int(h["linea"]) == ex["linea"]
+    except (TypeError, ValueError):
+        return False
+
+
+def aplicar_excepcion(h, vigentes, vencidas):
+    """Se llama DESPUÉS de decidir(): una excepción vigente le gana al bloqueo."""
+    datos = ("id", "razon", "vence", "aprobado_por", "tipo")
+    ex = next((x for x in vigentes if _coincide(x, h)), None)
+    h["excepcion"] = {k: ex[k] for k in datos} if ex else None
+    vieja = None if ex else next((x for x in vencidas if _coincide(x, h)), None)
+    h["excepcion_vencida"] = {k: vieja[k] for k in datos} if vieja else None
+    if ex:
+        h["bloquea"] = False
+        h["sla"] = None
+
+
 # ── Render de la CLI (sección 6) ──────────────────────────────────────────
 def campo(etiqueta, valor):
     prefijo = f"    {etiqueta + ':':<9}"
@@ -192,6 +292,8 @@ def campo(etiqueta, valor):
 
 
 def flecha(h, modo):
+    if h.get("excepcion"):
+        return "→ NO BLOQUEA (excepción vigente)"
     if h["bloquea"]:
         return "→ BLOQUEARÍA (modo report: no se bloquea)" if modo == "report" else "→ BLOQUEA"
     if h["accion"] == "avisa":
@@ -207,20 +309,33 @@ def bloque(n, h, modo):
     tipo = f"{h['titulo']} ({h['cwe']})" if h["cwe"] else h["titulo"]
     if h["severidad_estimada"]:
         tipo += " · severidad estimada (la herramienta no la reporta)"
+    cabecera = [
+        f"{ICONO_SEV.get(h['severidad'], '⚪')} [{n}] {h['severidad']} · {icono_cat} {nombre_cat}{subtipo}   [{herramientas}]",
+        campo("Tipo", tipo),
+        campo("Archivo", f"{h['archivo']}:{h['linea']}" if h["linea"] else (h["archivo"] or "—")),
+    ]
+    ex = h.get("excepcion")
+    if ex:                                       # visible, pero no bloquea
+        tipo_ex = f" ({ex['tipo']})" if ex["tipo"] else ""
+        aprob = f" (aprob. {ex['aprobado_por']})" if ex["aprobado_por"] else ""
+        return "\n".join([*cabecera,
+                          campo("Estado", f"⚠️ EXCEPCIÓN ACTIVA hasta {ex['vence']}{tipo_ex}"),
+                          campo("Razón", ex["razon"] + aprob),
+                          "    " + flecha(h, modo)])
     if h["nuevo"]:
         nuevo = f"Sí (commit {h['commit']})" if h["commit"] else "Sí"
     else:
         nuevo = "No (deuda preexistente)"
-    return "\n".join([
-        f"{ICONO_SEV.get(h['severidad'], '⚪')} [{n}] {h['severidad']} · {icono_cat} {nombre_cat}{subtipo}   [{herramientas}]",
-        campo("Tipo", tipo),
-        campo("Archivo", f"{h['archivo']}:{h['linea']}" if h["linea"] else (h["archivo"] or "—")),
-        campo("Qué es", h["que_es"]),
-        campo("Riesgo", h["riesgo"]),
-        campo("Nuevo", nuevo),
-        campo("Arreglo", h["arreglo"]),
-        "    " + flecha(h, modo),
-    ])
+    lineas = [*cabecera,
+              campo("Qué es", h["que_es"]),
+              campo("Riesgo", h["riesgo"]),
+              campo("Nuevo", nuevo),
+              campo("Arreglo", h["arreglo"])]
+    vieja = h.get("excepcion_vencida")
+    if vieja:
+        lineas.append(campo("Nota", f"tenía la excepción {vieja['id']}, VENCIDA el {vieja['vence']} → ya no "
+                                    "aplica. Renuévala (con aprobación de seguridad) o corrige el hallazgo"))
+    return "\n".join([*lineas, "    " + flecha(h, modo)])
 
 
 def lenguajes(markers):
@@ -271,7 +386,8 @@ def pie_artifacts(ctx, modulos):
 
 def render(ctx, modo, estados, hallazgos):
     bloq = [h for h in hallazgos if h["bloquea"]]
-    otros = [h for h in hallazgos if not h["bloquea"]]
+    exc = [h for h in hallazgos if h.get("excepcion")]
+    otros = [h for h in hallazgos if not h["bloquea"] and not h.get("excepcion")]
     esc, errores = escaneres(estados, ctx["esperados"])
     L = [DOBLE, f"  SECURITY GATE · {ctx['etiqueta']} · {ctx['repo']}", DOBLE, "",
          f"  Lenguaje detectado: {lenguajes(ctx['markers'])}", "", "  Escáneres ejecutados:", *esc]
@@ -285,6 +401,11 @@ def render(ctx, modo, estados, hallazgos):
         L += [bloque(n, h, modo), ""]
     if not bloq:
         L += ["  (sin hallazgos HIGH/CRITICAL nuevos)", ""]
+    if exc:
+        L += [SIMPLE, "  EXCEPCIONES ACTIVAS (no bloquean)", SIMPLE, ""]
+        for h in exc:
+            n += 1
+            L += [bloque(n, h, modo), ""]
     L += [SIMPLE, "  OTROS HALLAZGOS (no bloquean, pero deben corregirse)", SIMPLE, ""]
     for h in otros:
         n += 1
@@ -298,7 +419,10 @@ def render(ctx, modo, estados, hallazgos):
     linea_bloquea = (f"  Bloquea: 0 (modo report; habrían bloqueado {len(bloq)})" if modo == "report"
                      else f"  Bloquea: {len(bloq)} (los HIGH/CRITICAL nuevos)")
     modulos = ", ".join(m for m, _ in MODULOS if m in estados) or "ninguno"
-    L += [SIMPLE, f"  Resumen: {resumen}", linea_bloquea, "",
+    L += [SIMPLE, f"  Resumen: {resumen}", linea_bloquea]
+    if exc:
+        L.append(f"  Exceptuados: {len(exc)} (excepción vigente en .security-exceptions.yml)")
+    L += ["",
           f"  ¿Crees que {'[1]' if bloq else '[n]'} es un falso positivo?",
           "  → Agrega la excepción en .security-exceptions.yml (razón + vencimiento).",
           "    La revisa seguridad (CODEOWNERS).", "",
@@ -337,12 +461,14 @@ def main():
         cat = yaml.safe_load((Path(__file__).resolve().parent / "explicaciones.yml").read_text(encoding="utf-8")) or {}
         estados, hallazgos = cargar(env("REPORTS_DIR", "reports"), pol.get("severidades") or {})
         hallazgos = N.deduplicar(hallazgos)
+        vigentes, vencidas = cargar_excepciones(env("EXCEPTIONS", ".security-exceptions.yml"))
         cambios = (lineas_cambiadas(ctx["base"])
                    if ctx["evento"] == "pull_request" and not ctx["todo_nuevo"] else {})
         for h in hallazgos:
             explicar(h, cat)
             marcar_nuevo(h, ctx, cambios)
             decidir(h, pol)
+            aplicar_excepcion(h, vigentes, vencidas)   # después de decidir: la excepción gana al bloqueo
         hallazgos.sort(key=lambda h: (ORDEN_SEV.get(h["severidad"], 9), not h["nuevo"], h["archivo"], h["linea"] or 0))
         bloquean = sum(1 for h in hallazgos if h["bloquea"])
         cli = render(ctx, modo, estados, hallazgos)

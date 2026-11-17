@@ -1,0 +1,63 @@
+# Excepciones del security gate (falsos positivos y riesgos aceptados).
+#
+# Cualquier cambio a este archivo requiere aprobación de seguridad (CODEOWNERS).
+# Todo el contenido vulnerable de samples/ es FICTICIO.
+#
+# FORMATO de cada entrada:
+#   id:           nombre corto para identificarla en avisos y en la CLI (recomendado)
+#   regla:        id de la regla del hallazgo, tal como lo muestra la CLI       (OBLIGATORIO)
+#                 ej.: B608 (Bandit), lab.python.sqli-string-building (Semgrep),
+#                      alolab-fake-api-key (Gitleaks), CVE-2018-18074 (Trivy/pip-audit)
+#   archivo:      ruta relativa a la raíz del repo, exacta y sin comodines     (OBLIGATORIO)
+#                 → nunca se puede excluir una regla entera para todo el repo
+#   linea:        opcional; si se omite, aplica a cualquier línea de ese archivo
+#   razon:        por qué no es explotable o por qué se acepta el riesgo        (OBLIGATORIO)
+#   aprobado_por: quién de seguridad la aprobó
+#   creado:       fecha ISO (AAAA-MM-DD)
+#   vence:        fecha ISO (AAAA-MM-DD). Desde el día siguiente la excepción  (OBLIGATORIO)
+#                 deja de aplicar y el hallazgo vuelve a bloquear
+#   tipo:         falso_positivo | riesgo_aceptado
+#
+# Una entrada inválida (sin regla, archivo, razon o vence, con fecha mal escrita
+# o tipo desconocido) se IGNORA con un ::warning:: y no exceptúa nada.
+
+exceptions:
+  # ── (a) VIGENTE ────────────────────────────────────────────────────────
+  # SQL injection de la sample. Semgrep la reporta como HIGH en la línea 9
+  # (el execute) → es la que bloquea; con esta excepción NO bloquea y aparece
+  # en la sección "EXCEPCIONES ACTIVAS (no bloquean)".
+  - id: semgrep-sqli-sample
+    regla: lab.python.sqli-string-building
+    archivo: samples/python/vuln_sql.py
+    linea: 9
+    razon: "Sample FICTICIA del laboratorio; el código nunca se ejecuta ni recibe input externo."
+    aprobado_por: davidoberst
+    creado: 2026-11-17
+    vence: 2099-01-01
+    tipo: falso_positivo
+
+  # (a) VIGENTE — el mismo caso visto por Bandit (B608, línea 8, MEDIUM).
+  # No bloquea por severidad, pero así también se muestra como excepción activa.
+  - id: bandit-B608-sample
+    regla: B608
+    archivo: samples/python/vuln_sql.py
+    linea: 8
+    razon: "Sample FICTICIA del laboratorio; el código nunca se ejecuta ni recibe input externo."
+    aprobado_por: davidoberst
+    creado: 2026-11-17
+    vence: 2099-01-01
+    tipo: falso_positivo
+
+  # ── (b) VENCIDA ────────────────────────────────────────────────────────
+  # Secreto ficticio detectado por Gitleaks (CRITICAL). La excepción venció,
+  # así que el gate la IGNORA: el hallazgo vuelve a bloquear (si es nuevo)
+  # con una nota de "excepción vencida" y un ::warning:: para renovarla.
+  - id: gitleaks-fake-key-vencida
+    regla: alolab-fake-api-key
+    archivo: samples/python/fake_secret.py
+    linea: 5
+    razon: "Key FICTICIA del laboratorio (formato ALOLAB_ inventado)."
+    aprobado_por: davidoberst
+    creado: 2024-06-01
+    vence: 2025-01-01
+    tipo: riesgo_aceptado

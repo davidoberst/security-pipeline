@@ -87,6 +87,7 @@ def gitleaks(data, sev):
         herramienta="gitleaks", regla=f.get("RuleID", ""), clase="secreto", subtipo="secreto",
         severidad=severidad(sev.get("gitleaks", "CRITICAL"), None, "CRITICAL"),
         archivo=ruta_relativa(f.get("File")), linea=f.get("StartLine"), cwe="CWE-798",
+        ids=[f.get("RuleID", "")],                # al deduplicar se conservan todas las reglas
         titulo=f.get("Description") or "Secreto en el código", mensaje=f.get("Description", ""),
         commit=(f.get("Commit") or "")[:7]) for f in (data or [])]
 

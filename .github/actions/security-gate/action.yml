@@ -13,6 +13,10 @@ inputs:
     description: Ruta a la política.
     required: false
     default: gate-config/policy.yml
+  exceptions:
+    description: Ruta al archivo de excepciones (si no existe, no hay excepciones).
+    required: false
+    default: .security-exceptions.yml
   markers:
     description: Salida "markers" de detect-languages.
     required: false
@@ -80,6 +84,7 @@ runs:
         REPORTS_DIR: ${{ steps.prep.outputs.reports }}
         OUT_DIR: ${{ steps.prep.outputs.out }}
         POLICY: ${{ inputs.policy }}
+        EXCEPTIONS: ${{ inputs.exceptions }}
         MODE: ${{ inputs.mode }}
         MARKERS: ${{ inputs.markers }}
         EXPECTED_MODULES: ${{ inputs.expected-modules }}

@@ -16,8 +16,9 @@ solo_nuevos: true
 # Plazo en días para lo que va a backlog.
 sla_dias:
   CRITICAL: 7          # deuda preexistente
-  HIGH: 15             # deuda preexistente
-  MEDIUM: 30
+  HIGH: 30             # deuda preexistente
+  MEDIUM: 90
+  LOW: 180             # LOW es "informa": el SLA no se muestra en la CLI
 
 # Traducción de la escala de cada herramienta a CRITICAL/HIGH/MEDIUM/LOW/INFO.
 # "_otro" = valor si la herramienta trae algo no listado.
