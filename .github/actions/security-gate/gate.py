@@ -292,8 +292,11 @@ def aplicar_excepcion(h, vigentes, vencidas):
 
 # ── Render de la CLI (sección 6) ──────────────────────────────────────────
 def campo(etiqueta, valor):
-    prefijo = f"    {etiqueta + ':':<9}"
-    return textwrap.fill(str(valor), width=110, initial_indent=prefijo, subsequent_indent=" " * len(prefijo),
+    # Etiquetas cortas alineadas a 9; una pregunta ("¿…?") va sin ':' y el valor sigue en la
+    # misma línea. Las continuaciones se alinean con las de los demás campos.
+    etiqueta = etiqueta if etiqueta.endswith("?") else etiqueta + ":"
+    prefijo = f"    {etiqueta:<9}" if len(etiqueta) < 9 else f"    {etiqueta} "
+    return textwrap.fill(str(valor), width=110, initial_indent=prefijo, subsequent_indent=" " * 13,
                          break_long_words=False, break_on_hyphens=False)
 
 
@@ -308,7 +311,7 @@ def flecha(h, modo):
     return "→ INFORMA"
 
 
-def bloque(n, h, modo):
+def bloque(n, h, modo, es_pr=False):
     icono_cat, nombre_cat = CATEGORIAS.get(h["categoria"], CATEGORIAS["seguridad"])
     herramientas = ", ".join(NOMBRE_CORTO.get(t, t) for t in h["herramientas"])
     subtipo = f" ({h['subtipo']})" if h["subtipo"] else ""
@@ -331,11 +334,11 @@ def bloque(n, h, modo):
     if h["nuevo"]:
         nuevo = f"Sí (commit {h['commit']})" if h["commit"] else "Sí"
     else:
-        nuevo = "No (deuda preexistente)"
+        nuevo = "No — ya existía en el repo"
     lineas = [*cabecera,
               campo("Qué es", h["que_es"]),
               campo("Riesgo", h["riesgo"]),
-              campo("Nuevo", nuevo),
+              campo("¿Introducido por este commit?" if es_pr else "¿Hallazgo nuevo?", nuevo),
               campo("Arreglo", h["arreglo"])]
     vieja = h.get("excepcion_vencida")
     if vieja:
@@ -370,16 +373,37 @@ def escaneres(estados, esperados):
     return lineas, errores
 
 
-def resultado(modo, n):
+def resultado(modo, n, es_pr=False):
+    # "este commit" / "mergear" solo en PR: en push / nocturno / manual no hay diff de PR.
     s = "" if n == 1 else "s"
+    cuanto = f"este commit agrega {n} HIGH/CRITICAL" if es_pr else f"{n} HIGH/CRITICAL nuevo{s}"
     if modo == "report":
         if n:
-            return [f"  RESULTADO: ⚠️ MODO REPORT — habría bloqueado {n} hallazgo{s} HIGH/CRITICAL nuevo{s}",
+            return [f"  RESULTADO: ⚠️ MODO REPORT — {cuanto} (habría bloqueado)",
                     "             (SECURITY_GATE_MODE=report: no se bloquea)"]
         return ["  RESULTADO: ✅ APROBADO (modo report) — sin hallazgos HIGH/CRITICAL nuevos"]
     if n:
-        return [f"  RESULTADO: ❌ BLOQUEADO — {n} hallazgo{s} HIGH/CRITICAL nuevo{s}"]
+        return [f"  RESULTADO: ❌ BLOQUEADO — {cuanto}{' (corregir para mergear)' if es_pr else ''}"]
     return ["  RESULTADO: ✅ APROBADO — sin hallazgos HIGH/CRITICAL nuevos"]
+
+
+def encabezados(es_pr, modo):
+    """Títulos de las secciones de la lista. Variante neutral fuera de un PR."""
+    if es_pr:
+        bloq = ("LO QUE BLOQUEARÍA EL PR (modo report)" if modo == "report" else "LO QUE BLOQUEA EL PR") \
+               + " · introducido por este commit · corregir para mergear"
+        return {"bloq": bloq,
+                "nuevos": "TAMBIÉN INTRODUCIDAS POR ESTE COMMIT · severidad MEDIUM/LOW · no bloquean, pero DEBEN corregirse",
+                "viejos": "VULNERABILIDADES YA EXISTENTES EN EL REPOSITORIO · no introducidas por este commit · "
+                          "no bloquean el PR",
+                "viejos_ctx": "Ya existían antes de esta rama. No corresponden a este PR y no lo bloquean, "
+                              "deben corregirse."}
+    bloq = ("LO QUE BLOQUEARÍA (modo report)" if modo == "report" else "LO QUE BLOQUEA") \
+           + " · HIGH/CRITICAL nuevos · deben corregirse"
+    return {"bloq": bloq,
+            "nuevos": "TAMBIÉN NUEVAS · severidad MEDIUM/LOW · no bloquean, pero DEBEN corregirse",
+            "viejos": "VULNERABILIDADES YA EXISTENTES EN EL REPOSITORIO · no bloquean",
+            "viejos_ctx": "Deuda existente en el código escaneado. No bloquea, pero debe corregirse."}
 
 
 def pie_artifacts(ctx, modulos):
@@ -394,30 +418,39 @@ def render(ctx, modo, estados, hallazgos):
     bloq = [h for h in hallazgos if h["bloquea"]]
     exc = [h for h in hallazgos if h.get("excepcion")]
     otros = [h for h in hallazgos if not h["bloquea"] and not h.get("excepcion")]
+    otros_nuevos = [h for h in otros if h["nuevo"]]
+    otros_viejos = [h for h in otros if not h["nuevo"]]
+    es_pr = ctx["evento"] == "pull_request"
+    tit = encabezados(es_pr, modo)
     esc, errores = escaneres(estados, ctx["esperados"])
     L = [DOBLE, f"  SECURITY GATE · {ctx['etiqueta']} · {ctx['repo']}", DOBLE, "",
          f"  Lenguaje detectado: {lenguajes(ctx['markers'])}", "", "  Escáneres ejecutados:", *esc]
     if errores:
         L += ["", "  ⚠️  Errores de herramienta (NO bloquean, pero esos resultados faltan):"]
         L += [f"     - {e}" for e in errores]
-    L += ["", SIMPLE, *resultado(modo, len(bloq)), SIMPLE, ""]
+    L += ["", SIMPLE, *resultado(modo, len(bloq), es_pr), SIMPLE, ""]
+    # Orden: ① bloqueantes → excepciones → ② nuevos no bloqueantes → ③ ya existentes.
+    # Numeración [n] continua; lista completa, sin colapsar nada.
     n = 0
-    for h in bloq:
-        n += 1
-        L += [bloque(n, h, modo), ""]
+
+    def seccion(titulo, grupo, contexto=None):
+        nonlocal n
+        L.extend([SIMPLE, f"  {titulo}", SIMPLE, ""])
+        if contexto:
+            L.extend([f"  {contexto}", ""])
+        for h in grupo:
+            n += 1
+            L.extend([bloque(n, h, modo, es_pr), ""])
+
+    seccion(tit["bloq"], bloq)
     if not bloq:
         L += ["  (sin hallazgos HIGH/CRITICAL nuevos)", ""]
     if exc:
-        L += [SIMPLE, "  EXCEPCIONES ACTIVAS (no bloquean)", SIMPLE, ""]
-        for h in exc:
-            n += 1
-            L += [bloque(n, h, modo), ""]
-    L += [SIMPLE, "  OTROS HALLAZGOS (no bloquean, pero deben corregirse)", SIMPLE, ""]
-    for h in otros:
-        n += 1
-        L += [bloque(n, h, modo), ""]
-    if not otros:
-        L += ["  (ninguno)", ""]
+        seccion("EXCEPCIONES ACTIVAS · aceptadas y firmadas en .security-exceptions.yml · no bloquean", exc)
+    if otros_nuevos:
+        seccion(tit["nuevos"], otros_nuevos)
+    if otros_viejos:
+        seccion(tit["viejos"], otros_viejos, tit["viejos_ctx"])
     cuenta = {s: sum(1 for h in hallazgos if h["severidad"] == s) for s in ORDEN_SEV}
     resumen = " · ".join(f"{cuenta[s]} {s}" for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"))
     if cuenta["INFO"]:
@@ -484,8 +517,13 @@ def main():
                       else "✅ Security gate: APROBADO (modo report)")
         else:
             res = "bloqueado" if bloquean else "aprobado"
-            titulo = (f"❌ Security gate: BLOQUEADO — {bloquean} HIGH/CRITICAL nuevo{'s' if bloquean != 1 else ''}"
-                      if bloquean else "✅ Security gate: APROBADO")
+            if not bloquean:
+                titulo = "✅ Security gate: APROBADO"
+            elif ctx["evento"] == "pull_request":
+                vulns = "vulnerabilidad" if bloquean == 1 else "vulnerabilidades"
+                titulo = f"❌ Security gate: BLOQUEADO — este commit agrega {bloquean} {vulns} HIGH/CRITICAL"
+            else:
+                titulo = f"❌ Security gate: BLOQUEADO — {bloquean} HIGH/CRITICAL nuevo{'s' if bloquean != 1 else ''}"
 
     print(cli)                                               # 1) log del job
     (out / "cli.txt").write_text(cli + "\n", encoding="utf-8")
