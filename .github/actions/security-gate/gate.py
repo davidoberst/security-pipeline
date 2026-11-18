@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import textwrap
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import yaml
@@ -26,10 +26,14 @@ ICONO_SEV = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"
 CATEGORIAS = {"seguridad": ("🔒", "SEGURIDAD"), "logica": ("⚙️", "LÓGICA"), "calidad": ("🧹", "CALIDAD")}
 MODULOS = [("scan-common", "común"), ("scan-python", "python"), ("scan-go", "go"), ("scan-node", "node")]
 NOMBRE_LARGO = {"gitleaks": "Gitleaks", "trivy": "Trivy fs", "semgrep": "Semgrep",
-                "bandit": "Bandit", "pip-audit": "pip-audit", "ruff": "Ruff"}
-NOMBRE_CORTO = {**NOMBRE_LARGO, "trivy": "Trivy"}
+                "bandit": "Bandit", "pip-audit": "pip-audit", "ruff": "Ruff",
+                "gosec": "gosec", "govulncheck": "govulncheck", "staticcheck": "staticcheck",
+                "eslint": "ESLint", "osv-scanner": "OSV-Scanner"}
+NOMBRE_CORTO = {**NOMBRE_LARGO, "trivy": "Trivy", "osv-scanner": "OSV"}
 NORMALIZADORES = {"gitleaks": N.gitleaks, "trivy": N.trivy, "semgrep": N.semgrep,
-                  "bandit": N.bandit, "pip-audit": N.pip_audit, "ruff": N.ruff}
+                  "bandit": N.bandit, "pip-audit": N.pip_audit, "ruff": N.ruff,
+                  "gosec": N.gosec, "govulncheck": N.govulncheck, "staticcheck": N.staticcheck,
+                  "eslint": N.eslint, "osv-scanner": N.osv_scanner}
 DOBLE, SIMPLE = "═" * 60, "─" * 60
 MARCA_COMENTARIO = "<!-- security-gate-lab -->"
 LIMITE_COMENTARIO = 60000            # GitHub admite ~65k caracteres por comentario
@@ -113,7 +117,9 @@ def _buscar_regla(reglas, rid):
 def explicar(h, cat):
     regla = _buscar_regla(cat.get("reglas") or {}, h["regla"])
     h["cwe"] = regla.get("cwe") or h["cwe"]
-    por_cwe = (cat.get("cwe") or {}).get(h["cwe"], {})
+    # En un CVE de dependencia el arreglo es actualizarla: los textos por CWE (pensados
+    # para código propio) no aplican; se usa el genérico "cve".
+    por_cwe = {} if h["clase"] == "cve" else (cat.get("cwe") or {}).get(h["cwe"], {})
     gen = (cat.get("genericos") or {}).get(h["clase"], {})
     for k in ("titulo", "subtipo", "categoria"):
         h[k] = regla.get(k) or h.get(k) or por_cwe.get(k) or gen.get(k) or ""
@@ -199,10 +205,14 @@ def _fecha(valor):
         return None
 
 
+def _vacio(e, k):
+    return e.get(k) is None or str(e.get(k)).strip() == ""
+
+
 def cargar_excepciones(ruta, hoy=None):
     """(vigentes, vencidas). Sin archivo → sin excepciones. Una entrada inválida se
     ignora con un warning y NO exceptúa nada."""
-    hoy = hoy or datetime.now(timezone.utc).date()
+    hoy = hoy or datetime.now(UTC).date()
     p = Path(ruta)
     if not p.is_file():
         return [], []
@@ -223,24 +233,20 @@ def cargar_excepciones(ruta, hoy=None):
             aviso(f"excepción #{i} de {ruta} inválida: no es un objeto → se ignora")
             continue
         eid = str(e.get("id") or f"#{i}").strip()
-
-        def vacio(k):
-            return e.get(k) is None or str(e.get(k)).strip() == ""
-
-        problemas = [f"falta '{k}'" for k in ("regla", "archivo", "razon", "vence") if vacio(k)]
-        archivo = "" if vacio("archivo") else N.ruta_relativa(str(e["archivo"]).strip())
-        if not vacio("archivo") and (archivo in ("", ".", "/") or any(c in archivo for c in "*?[")):
+        problemas = [f"falta '{k}'" for k in ("regla", "archivo", "razon", "vence") if _vacio(e, k)]
+        archivo = "" if _vacio(e, "archivo") else N.ruta_relativa(str(e["archivo"]).strip())
+        if not _vacio(e, "archivo") and (archivo in ("", ".", "/") or any(c in archivo for c in "*?[")):
             problemas.append(f"'archivo' debe ser una ruta exacta, sin comodines: {e['archivo']}")
-        vence = None if vacio("vence") else _fecha(e["vence"])
-        if not vacio("vence") and vence is None:
+        vence = None if _vacio(e, "vence") else _fecha(e["vence"])
+        if not _vacio(e, "vence") and vence is None:
             problemas.append(f"'vence' no es una fecha ISO (AAAA-MM-DD): {e['vence']}")
         linea = None
-        if not vacio("linea"):
+        if not _vacio(e, "linea"):
             try:
                 linea = int(e["linea"])
             except (TypeError, ValueError):
                 problemas.append(f"'linea' no es un número: {e['linea']}")
-        tipo = "" if vacio("tipo") else str(e["tipo"]).strip()
+        tipo = "" if _vacio(e, "tipo") else str(e["tipo"]).strip()
         if tipo and tipo not in TIPOS_EXCEPCION:
             problemas.append(f"'tipo' debe ser {' o '.join(TIPOS_EXCEPCION)}: {tipo}")
         if problemas:
@@ -249,7 +255,7 @@ def cargar_excepciones(ruta, hoy=None):
 
         ex = {"id": eid, "regla": str(e["regla"]).strip(), "archivo": archivo, "linea": linea,
               "razon": " ".join(str(e["razon"]).split()), "vence": vence.isoformat(),
-              "aprobado_por": "" if vacio("aprobado_por") else str(e["aprobado_por"]).strip(), "tipo": tipo}
+              "aprobado_por": "" if _vacio(e, "aprobado_por") else str(e["aprobado_por"]).strip(), "tipo": tipo}
         if vence < hoy:
             aviso(f"excepción {eid} VENCIÓ el {ex['vence']} → ya no aplica y el hallazgo vuelve a bloquear. "
                   "Renuévala (con aprobación de seguridad) o corrige el hallazgo")

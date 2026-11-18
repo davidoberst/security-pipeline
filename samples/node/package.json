@@ -1,0 +1,10 @@
+{
+  "name": "alolab-sample-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MUESTRA FICTICIA — lodash 4.17.20 tiene CVE-2021-23337 a propósito.",
+  "main": "index.js",
+  "dependencies": {
+    "lodash": "4.17.20"
+  }
+}

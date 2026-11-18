@@ -45,3 +45,30 @@ severidades:
     severidad: LOW                 # calidad
     logica_severidad: MEDIUM       # reglas que indican un bug real
     logica_prefijos: [F821, F822, F823, F632, E9, PLE]
+
+  # ── Go ──────────────────────────────────────────────────────────────────
+  gosec:
+    HIGH: HIGH
+    MEDIUM: MEDIUM
+    LOW: LOW
+    _otro: MEDIUM
+  govulncheck: MEDIUM  # no trae severidad: se usa la de Trivy para el mismo CVE; si Trivy no lo vio, este valor
+  staticcheck:
+    severidad: LOW                 # calidad (S*, ST*, QF*, U1000)
+    logica_severidad: MEDIUM       # SA* = bugs reales; compile = el código no compila
+    logica_prefijos: [SA, compile]
+
+  # ── Node (JS backend) ───────────────────────────────────────────────────
+  osv-scanner: MEDIUM  # no trae severidad: se usa la de Trivy para el mismo CVE; si Trivy no lo vio, este valor
+  eslint:
+    seguridad:                     # reglas security/*: severidad según la config versionada de scan-node
+      ERROR: HIGH                  # "error" = reglas de alta señal (eval, child_process, require dinámico…)
+      WARNING: MEDIUM              # "warn"  = reglas más ruidosas
+      _otro: MEDIUM
+    severidad: LOW                 # resto de reglas = calidad
+    logica_severidad: MEDIUM       # reglas que indican un bug real
+    logica_reglas: [parse-error, no-undef, no-unreachable, no-dupe-keys, no-dupe-else-if, no-duplicate-case,
+                    no-self-compare, no-self-assign, no-constant-condition, no-constant-binary-expression,
+                    no-unsafe-finally, no-unsafe-negation, no-unsafe-optional-chaining, no-func-assign,
+                    no-const-assign, no-cond-assign, no-compare-neg-zero, use-isnan, valid-typeof,
+                    getter-return, no-setter-return, no-dupe-class-members, no-import-assign]

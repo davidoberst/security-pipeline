@@ -1,0 +1,8 @@
+# MUESTRA FICTICIA — Dockerfile inseguro a propósito para Trivy (misconfig).
+# DS002: no define USER → el contenedor corre como root.
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY samples/python/ /app/
+
+CMD ["python", "-c", "print('muestra ficticia')"]

@@ -1,0 +1,24 @@
+# Ruleset Semgrep FIJO y versionado en el repo (no se descarga del registro).
+rules:
+  - id: lab.go.command-injection
+    languages: [go]
+    severity: ERROR
+    message: >
+      Comando de shell armado con datos variables (sh -c / bash -c / cmd /C).
+      Ejecuta el binario directamente con argumentos fijos: exec.Command("ping", "-c", "1", host),
+      y valida el valor contra una lista permitida.
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+    patterns:
+      - pattern-either:
+          - pattern: exec.Command($SH, $FLAG, $CMD, ...)
+          - pattern: exec.CommandContext($CTX, $SH, $FLAG, $CMD, ...)
+      - metavariable-regex:
+          metavariable: $SH
+          regex: ^"(/bin/|/usr/bin/)?(sh|bash|zsh|cmd|cmd\.exe|powershell|pwsh)"$
+      - metavariable-regex:
+          metavariable: $FLAG
+          regex: ^"(-c|/c|/C|-Command)"$
+      - pattern-not: exec.Command($SH, $FLAG, "...", ...)
+      - pattern-not: exec.CommandContext($CTX, $SH, $FLAG, "...", ...)

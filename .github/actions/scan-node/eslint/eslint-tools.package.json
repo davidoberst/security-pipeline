@@ -1,0 +1,11 @@
+{
+  "name": "scan-node-eslint-tools",
+  "private": true,
+  "description": "Herramientas ESLint del módulo scan-node (versiones fijas; se instalan con npm ci).",
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.14.0",
+    "eslint-plugin-security": "4.2.1",
+    "globals": "17.14.0"
+  }
+}
