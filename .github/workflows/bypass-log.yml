@@ -1,0 +1,110 @@
+# Registro automático de bypasses del security gate.
+# Si un PR se mergea aunque la corrida de security.yml de su head SHA terminó en
+# failure con el gate BLOQUEADO, el bot escribe bypass-log/<fecha>-<commit>.json en main.
+# En cualquier otro caso no escribe nada. NUNCA falla: si no puede escribir, deja un
+# ::warning con el JSON y termina en verde.
+name: bypass-log
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}                    # todo se concede a nivel de job
+
+concurrency:
+  group: bypass-log                # serializa los pushes a main
+  cancel-in-progress: false
+
+jobs:
+  registrar:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write              # commit del log a main
+      actions: read                # corridas y artifacts de security.yml
+      checks: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+    steps:
+      # Código y destino = la rama base ya con el merge (no el código del PR).
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: ¿El gate bloqueó este PR?
+        id: gate
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Corrida más reciente de security.yml (evento pull_request) para el head SHA.
+          run=$(gh api "repos/$REPO/actions/workflows/security.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=20" \
+                  --jq '.workflow_runs | sort_by(.created_at) | last // empty | {id, conclusion, html_url}' 2>gh.err) || {
+            echo "::warning title=bypass-log::no se pudieron consultar las corridas de security.yml: $(tail -c 300 gh.err)"
+            echo "bypass=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          if [ -z "$run" ]; then
+            echo "Sin corrida de security.yml para $HEAD_SHA → nada que registrar."
+            echo "bypass=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          id=$(jq -r .id <<< "$run"); conclusion=$(jq -r '.conclusion // "sin terminar"' <<< "$run")
+          url=$(jq -r .html_url <<< "$run")
+          echo "Corrida $url → conclusion: $conclusion"
+          if [ "$conclusion" != failure ]; then
+            echo "El gate no bloqueó (conclusion=$conclusion) → no se escribe nada."
+            echo "bypass=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          dir="$RUNNER_TEMP/gate-report"
+          gh run download "$id" -R "$REPO" -n security-gate-report -D "$dir" 2>gh.err \
+            || echo "::warning title=bypass-log::no se pudo descargar security-gate-report: $(tail -c 300 gh.err)"
+          # Defensa: la corrida pudo fallar por otro job. Si el gate SÍ decidió y no fue
+          # "bloqueado", no hubo bypass del gate. Sin decision.json = error del gate → se registra.
+          if [ -f "$dir/decision.json" ]; then
+            res=$(jq -r '.resultado // ""' "$dir/decision.json")
+            if [ "$res" != bloqueado ]; then
+              echo "La corrida falló pero el gate decidió '$res' → no es un bypass del gate."
+              echo "bypass=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          { echo "bypass=true"; echo "run_url=$url"; echo "report=$dir"; } >> "$GITHUB_OUTPUT"
+
+      - name: Escribir el registro
+        id: log
+        if: steps.gate.outputs.bypass == 'true'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTOR: ${{ github.event.pull_request.user.login }}
+          BYPASS_POR: ${{ github.event.pull_request.merged_by.login }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          RUN_URL: ${{ steps.gate.outputs.run_url }}
+          REPORT_DIR: ${{ steps.gate.outputs.report }}
+          LOG_DIR: bypass-log
+        run: python3 .github/actions/bypass-log/registrar.py || echo "::warning title=bypass-log::registrar.py falló (no se escribió el log)"
+
+      - name: Commit a ${{ github.event.pull_request.base.ref }}
+        if: steps.log.outputs.escrito == 'true'
+        shell: bash
+        env:
+          ARCHIVO: ${{ steps.log.outputs.archivo }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BYPASS_POR: ${{ github.event.pull_request.merged_by.login }}
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$ARCHIVO"
+          git commit -q -m "chore(bypass-log): registra override del PR #${PR_NUMBER} por ${BYPASS_POR} [skip ci]"
+          # Un reintento con rebase por si main avanzó mientras tanto. Nunca --force.
+          if git push origin "HEAD:$BASE_REF" 2>push.err \
+             || { git pull -q --rebase origin "$BASE_REF" && git push origin "HEAD:$BASE_REF" 2>push.err; }; then
+            echo "✓ Registrado $ARCHIVO en $BASE_REF"
+          else
+            echo "✗ NO se pudo escribir $ARCHIVO en $BASE_REF (push rechazado; ¿protección de rama?):"
+            cat push.err
+            echo "::warning title=bypass-log::push rechazado: el bypass del PR #${PR_NUMBER} NO quedó registrado en el repo. Contenido: $(jq -c . "$ARCHIVO")"
+          fi
+          exit 0

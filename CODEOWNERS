@@ -6,3 +6,4 @@
 gate-config/               @davidoberst
 .security-exceptions.yml   @davidoberst
 CODEOWNERS                 @davidoberst
+bypass-log/                @davidoberst
