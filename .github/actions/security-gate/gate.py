@@ -24,7 +24,8 @@ BLOQUEABLES = ("CRITICAL", "HIGH")   # nada fuera de esto bloquea, diga lo que d
 ORDEN_SEV = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 ICONO_SEV = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}
 CATEGORIAS = {"seguridad": ("🔒", "SEGURIDAD"), "logica": ("⚙️", "LÓGICA"), "calidad": ("🧹", "CALIDAD")}
-MODULOS = [("scan-common", "común"), ("scan-python", "python"), ("scan-go", "go"), ("scan-node", "node")]
+MODULOS = [("scan-common", "común"), ("scan-python", "python"), ("scan-go", "go"), ("scan-node", "node"),
+           ("scan-ts", "ts")]
 NOMBRE_LARGO = {"gitleaks": "Gitleaks", "trivy": "Trivy fs", "semgrep": "Semgrep",
                 "bandit": "Bandit", "pip-audit": "pip-audit", "ruff": "Ruff",
                 "gosec": "gosec", "govulncheck": "govulncheck", "staticcheck": "staticcheck",

@@ -1,7 +1,8 @@
 # Ruleset Semgrep FIJO y versionado en el repo (no se descarga del registro).
+# Cubre JavaScript y TypeScript (.ts/.tsx/.mts/.cts) con las mismas reglas.
 rules:
   - id: lab.js.eval-injection
-    languages: [javascript]
+    languages: [javascript, typescript]
     severity: ERROR
     message: >
       eval / new Function / vm con un valor no literal: si el valor viene de afuera,
@@ -31,7 +32,7 @@ rules:
       - pattern-not: Function(..., "...")
 
   - id: lab.js.command-injection
-    languages: [javascript]
+    languages: [javascript, typescript]
     severity: ERROR
     message: >
       child_process.exec/execSync con un comando no literal: pasa por una shell y

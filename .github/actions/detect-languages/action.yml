@@ -2,7 +2,9 @@ name: detect-languages
 description: >
   Detecta los lenguajes del repo por ARCHIVOS MARCADORES (no por extensión).
   Python = requirements.txt / pyproject.toml / Pipfile · Go = go.mod ·
-  Node (JS backend) = package.json cuyo directorio NO tiene tsconfig.json.
+  Node (JS backend) = package.json cuyo directorio NO tiene tsconfig.json ·
+  TypeScript = package.json cuyo directorio SÍ tiene tsconfig.json.
+  Node y TS son mutuamente excluyentes por directorio.
 
 inputs:
   languages:
@@ -10,6 +12,7 @@ inputs:
       "auto" (default) = detección automática.
       Lista exacta sin prefijos ("python,go") = solo esos lenguajes.
       Ajustes con prefijo ("+go,-node") = se aplican sobre lo detectado.
+      Lenguajes: python, go, node, ts.
     required: false
     default: auto
   path:
@@ -27,6 +30,9 @@ outputs:
   node:
     description: "true / false"
     value: ${{ steps.detect.outputs.node }}
+  ts:
+    description: "true / false"
+    value: ${{ steps.detect.outputs.ts }}
   markers:
     description: 'Texto legible, p. ej. "python (samples/python/requirements.txt)"'
     value: ${{ steps.detect.outputs.markers }}
@@ -51,17 +57,22 @@ runs:
 
         py=$(find_markers -name requirements.txt -o -name pyproject.toml -o -name Pipfile)
         go=$(find_markers -name go.mod)
-        node=""
+        # Por directorio de package.json: con tsconfig.json → ts; sin él → node (nunca ambos).
+        node="" ts=""
         while IFS= read -r pkg; do
-          if [ -n "$pkg" ] && [ ! -f "$(dirname "$pkg")/tsconfig.json" ]; then
+          [ -n "$pkg" ] || continue
+          if [ -f "$(dirname "$pkg")/tsconfig.json" ]; then
+            ts+="$(dirname "$pkg")/tsconfig.json"$'\n'
+          else
             node+="$pkg"$'\n'
           fi
         done <<< "$(find_markers -name package.json)"
         node=$(printf '%s' "$node" | sed '/^$/d')
+        ts=$(printf '%s' "$ts" | sed '/^$/d')
 
-        declare -A on=( [python]=false [go]=false [node]=false )
-        declare -A mk=( [python]="$py" [go]="$go" [node]="$node" )
-        for l in python go node; do
+        declare -A on=( [python]=false [go]=false [node]=false [ts]=false )
+        declare -A mk=( [python]="$py" [go]="$go" [node]="$node" [ts]="$ts" )
+        for l in python go node ts; do
           if [ -n "${mk[$l]}" ]; then on[$l]=true; fi
         done
 
@@ -73,7 +84,7 @@ runs:
           for t in "${toks[@]}"; do
             case "$t" in
               ""|+*|-*) ;;
-              *) for l in python go node; do on[$l]=false; done; break ;;
+              *) for l in python go node ts; do on[$l]=false; done; break ;;
             esac
           done
           for t in "${toks[@]}"; do
@@ -84,7 +95,7 @@ runs:
               *)  l=$t;     v=true ;;
             esac
             case "$l" in
-              python|go|node)
+              python|go|node|ts)
                 on[$l]=$v
                 if [ -z "${mk[$l]}" ]; then mk[$l]="forzado manual"; fi
                 ;;
@@ -94,7 +105,7 @@ runs:
         fi
 
         markers=""
-        for l in python go node; do
+        for l in python go node ts; do
           if [ "${on[$l]}" = true ]; then
             markers+="${markers:+; }$l ($(printf '%s\n' "${mk[$l]}" | paste -sd ',' -))"
           fi
@@ -104,8 +115,9 @@ runs:
           echo "python=${on[python]}"
           echo "go=${on[go]}"
           echo "node=${on[node]}"
+          echo "ts=${on[ts]}"
           echo "markers=${markers:-ninguno}"
         } >> "$GITHUB_OUTPUT"
 
-        echo "Detectado  → python=${on[python]}  go=${on[go]}  node=${on[node]}"
+        echo "Detectado  → python=${on[python]}  go=${on[go]}  node=${on[node]}  ts=${on[ts]}"
         echo "Marcadores → ${markers:-ninguno}"

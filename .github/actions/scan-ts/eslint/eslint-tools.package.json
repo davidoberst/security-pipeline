@@ -1,0 +1,14 @@
+{
+  "name": "scan-ts-eslint-tools",
+  "private": true,
+  "description": "Herramientas ESLint del módulo scan-ts (versiones fijas; se instalan con npm ci). Parser de TypeScript SIN type-checking.",
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "@typescript-eslint/eslint-plugin": "8.72.1",
+    "@typescript-eslint/parser": "8.72.1",
+    "eslint": "10.14.0",
+    "eslint-plugin-security": "4.2.1",
+    "globals": "17.14.0",
+    "typescript": "6.0.3"
+  }
+}

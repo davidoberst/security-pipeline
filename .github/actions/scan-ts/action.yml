@@ -1,0 +1,176 @@
+name: scan-ts
+description: >
+  Escáneres TypeScript: ESLint con @typescript-eslint/parser (SIN type-checking) +
+  @typescript-eslint/eslint-plugin + eslint-plugin-security (SAST seguridad y, en la
+  misma corrida, lógica / calidad) y osv-scanner (CVE de dependencias npm).
+  Nunca instala las dependencias del repo. Solo produce JSON + status.json; NUNCA falla.
+
+inputs:
+  artifact-name:
+    description: Nombre del artifact con los reportes.
+    required: false
+    default: scan-ts
+  node-version:
+    required: false
+    default: "24"
+  osv-scanner-version:
+    required: false
+    default: "2.7.0"
+  # Las versiones de ESLint y sus plugins están fijadas (con hash de integridad) en
+  # eslint/eslint-tools.package-lock.json y se instalan con npm ci.
+
+runs:
+  using: composite
+  steps:
+    # Proyectos = directorios con package.json Y tsconfig.json (mismo criterio que
+    # detect-languages; los que no tienen tsconfig.json son de scan-node).
+    # Lockfiles = los de esos directorios (osv-scanner los necesita).
+    - id: prep
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/security-reports/ts"
+        mkdir -p "$dir" "$RUNNER_TEMP/bin"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+        proyectos="$RUNNER_TEMP/scan-ts-proyectos.txt"
+        lockfiles="$RUNNER_TEMP/scan-ts-lockfiles.txt"
+        : > "$proyectos"; : > "$lockfiles"
+        while IFS= read -r pkg; do
+          d=$(dirname "$pkg")
+          [ -f "$d/tsconfig.json" ] || continue
+          echo "${d#./}" >> "$proyectos"
+          for lf in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; do
+            [ -f "$d/$lf" ] && echo "${d#./}/$lf" >> "$lockfiles"
+          done
+        done < <(find . \( -path ./.git -o -name node_modules -o -name .venv -o -name venv -o -name vendor \) -prune \
+                        -o -type f -name package.json -print | sort)
+        echo "Proyectos TS:   $(paste -sd ' ' "$proyectos")"
+        echo "Lockfiles:      $(paste -sd ' ' "$lockfiles")"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        echo "proyectos=$proyectos" >> "$GITHUB_OUTPUT"
+        echo "lockfiles=$lockfiles" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
+
+    - name: Instalar herramientas (versiones fijas, checksum / integridad verificados)
+      shell: bash
+      env:
+        OSV_VER: ${{ inputs.osv-scanner-version }}
+        ESLINT_SRC: ${{ github.action_path }}/eslint
+      run: |
+        # ESLint: package.json + lock versionados en el módulo, npm ci sin scripts.
+        tools="$RUNNER_TEMP/eslint-tools-ts"
+        mkdir -p "$tools"
+        cp "$ESLINT_SRC/eslint-tools.package.json" "$tools/package.json"
+        cp "$ESLINT_SRC/eslint-tools.package-lock.json" "$tools/package-lock.json"
+        cp "$ESLINT_SRC/eslint.config.mjs" "$tools/eslint.config.mjs"
+        ( cd "$tools" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error ) \
+          || echo "::warning title=scan-ts::no se pudo instalar ESLint"
+        # osv-scanner: binario de la release + SHA256SUMS oficial.
+        cd "$RUNNER_TEMP"
+        OSV=https://github.com/google/osv-scanner/releases/download/v${OSV_VER}
+        { curl -sSfLO "$OSV/osv-scanner_linux_amd64" \
+            && curl -sSfL "$OSV/osv-scanner_SHA256SUMS" -o osv.sums \
+            && grep " osv-scanner_linux_amd64\$" osv.sums | sha256sum -c - \
+            && install -m 0755 osv-scanner_linux_amd64 bin/osv-scanner; } \
+          || echo "::warning title=scan-ts::no se pudo instalar osv-scanner ${OSV_VER}"
+        exit 0
+
+    - name: ESLint TS (seguridad + lógica/calidad en una corrida, sin type-checking)
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        PROYECTOS: ${{ steps.prep.outputs.proyectos }}
+      run: |
+        if [ ! -s "$PROYECTOS" ]; then
+          echo "sin proyectos TypeScript (package.json + tsconfig.json)" > "$OUT/eslint.stderr.log"
+          echo skip > "$OUT/eslint.exit"
+          exit 0
+        fi
+        mapfile -t dirs < "$PROYECTOS"
+        tools="$RUNNER_TEMP/eslint-tools-ts"
+        set +e
+        # exit 1 = encontró problemas (JSON válido → ok); exit 2 = error de config/ESLint.
+        node "$tools/node_modules/eslint/bin/eslint.js" --config "$tools/eslint.config.mjs" \
+          --format json --output-file "$OUT/eslint.json" \
+          --no-warn-ignored --no-error-on-unmatched-pattern "${dirs[@]}" \
+          2> "$OUT/eslint.stderr.log"
+        echo $? > "$OUT/eslint.exit"
+        exit 0
+
+    - name: osv-scanner (CVE npm)
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        PROYECTOS: ${{ steps.prep.outputs.proyectos }}
+        LOCKFILES: ${{ steps.prep.outputs.lockfiles }}
+      run: |
+        if [ ! -s "$LOCKFILES" ]; then
+          if [ -s "$PROYECTOS" ]; then
+            echo "hay package.json pero ningún lockfile (package-lock.json / yarn.lock / pnpm-lock.yaml): osv-scanner no puede resolver versiones" > "$OUT/osv-scanner.stderr.log"
+          else
+            echo "sin proyectos TypeScript (package.json + tsconfig.json)" > "$OUT/osv-scanner.stderr.log"
+          fi
+          echo skip > "$OUT/osv-scanner.exit"
+          exit 0
+        fi
+        args=(); while IFS= read -r lf; do args+=(-L "$lf"); done < "$LOCKFILES"
+        set +e
+        # Solo los lockfiles npm (-L): así no repite requirements.txt / go.mod.
+        # exit 1 = encontró CVEs (JSON válido → ok).
+        osv-scanner scan source "${args[@]}" --format json --output-file "$OUT/osv-scanner.json" \
+          2> "$OUT/osv-scanner.stderr.log"
+        echo $? > "$OUT/osv-scanner.exit"
+        exit 0
+
+    # status.json: mismo contrato que scan-common / scan-python / scan-node.
+    - name: status.json
+      if: always()
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        python3 - "$OUT" scan-ts <<'PY'
+        import json, sys, pathlib
+        out, modulo = pathlib.Path(sys.argv[1]), sys.argv[2]
+        tools = []
+        for ex in sorted(out.glob("*.exit")):
+            name = ex.stem
+            code = ex.read_text().strip()
+            rep = out / f"{name}.json"
+            log = out / f"{name}.stderr.log"
+            if code == "skip":
+                estado = "omitido"
+                detalle = log.read_text(errors="replace").strip() if log.exists() else ""
+            else:
+                try:
+                    json.loads(rep.read_text(encoding="utf-8"))
+                    estado, detalle = "ok", ""
+                except FileNotFoundError:
+                    estado, detalle = "error", "la herramienta no generó su JSON"
+                except (ValueError, UnicodeDecodeError) as e:
+                    estado, detalle = "error", f"JSON inválido: {e}"
+                if estado == "error" and log.exists():
+                    detalle += " | " + log.read_text(errors="replace").strip()[-400:]
+            tools.append({"herramienta": name, "exit_code": code, "estado": estado,
+                          "detalle": detalle, "reporte": rep.name})
+        (out / "status.json").write_text(
+            json.dumps({"modulo": modulo, "herramientas": tools}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        for t in tools:
+            mark = "✓" if t["estado"] == "ok" else t["estado"].upper()
+            print(f"  {t['herramienta']:<10} {mark}  (exit {t['exit_code']})")
+            if t["estado"] == "error":
+                msg = t["detalle"].replace("\n", " ")[:200]
+                print(f"::warning title={modulo}/{t['herramienta']}::ERROR de herramienta (no bloquea): {msg}")
+        PY
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.prep.outputs.dir }}
+        retention-days: 14
+        if-no-files-found: warn

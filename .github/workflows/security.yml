@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       languages:
-        description: 'auto | lista exacta "python,go" | ajustes "+go,-node"'
+        description: 'auto | lista exacta "python,go,ts" | ajustes "+go,-node"'
         required: false
         default: auto
       tratar_todo_como_nuevo:
@@ -36,6 +36,7 @@ jobs:
       python: ${{ steps.langs.outputs.python }}
       go: ${{ steps.langs.outputs.go }}
       node: ${{ steps.langs.outputs.node }}
+      ts: ${{ steps.langs.outputs.ts }}
       markers: ${{ steps.langs.outputs.markers }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -93,10 +94,22 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/scan-node
 
+  scan-ts:
+    needs: detect
+    if: needs.detect.outputs.ts == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/scan-ts
+
   security-gate:
     # Único job que puede hacer fallar el pipeline (sin continue-on-error).
     # Solo bloquean hallazgos CRITICAL/HIGH nuevos; MEDIUM/LOW/INFO se informan.
-    needs: [detect, scan-common, scan-python, scan-go, scan-node]
+    needs: [detect, scan-common, scan-python, scan-go, scan-node, scan-ts]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -114,8 +127,9 @@ jobs:
           markers: ${{ needs.detect.outputs.markers }}
           # Módulos que DEBÍAN correr: si uno falta, la CLI lo muestra como "sin reporte".
           expected-modules: >-
-            ${{ format('scan-common{0}{1}{2}',
+            ${{ format('scan-common{0}{1}{2}{3}',
             needs.detect.outputs.python == 'true' && ' scan-python' || '',
             needs.detect.outputs.go == 'true' && ' scan-go' || '',
-            needs.detect.outputs.node == 'true' && ' scan-node' || '') }}
+            needs.detect.outputs.node == 'true' && ' scan-node' || '',
+            needs.detect.outputs.ts == 'true' && ' scan-ts' || '') }}
           treat-all-as-new: ${{ inputs.tratar_todo_como_nuevo == true && 'true' || 'false' }}

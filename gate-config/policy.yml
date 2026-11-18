@@ -71,4 +71,11 @@ severidades:
                     no-self-compare, no-self-assign, no-constant-condition, no-constant-binary-expression,
                     no-unsafe-finally, no-unsafe-negation, no-unsafe-optional-chaining, no-func-assign,
                     no-const-assign, no-cond-assign, no-compare-neg-zero, use-isnan, valid-typeof,
-                    getter-return, no-setter-return, no-dupe-class-members, no-import-assign]
+                    getter-return, no-setter-return, no-dupe-class-members, no-import-assign,
+                    constructor-super, no-this-before-super, no-class-assign,
+                    # TypeScript (scan-ts, sin type-checking): solo las que indican un bug real.
+                    # El resto de @typescript-eslint/* (no-explicit-any, no-unused-vars…) = calidad.
+                    "@typescript-eslint/no-duplicate-enum-values", "@typescript-eslint/no-misused-new",
+                    "@typescript-eslint/no-unsafe-declaration-merging",
+                    "@typescript-eslint/no-non-null-asserted-optional-chain",
+                    "@typescript-eslint/no-extra-non-null-assertion"]

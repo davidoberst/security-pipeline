@@ -1,0 +1,13 @@
+{
+  "name": "alolab-sample-ts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MUESTRA FICTICIA — minimist 1.2.5 tiene CVE-2021-44906 a propósito.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "minimist": "1.2.5"
+  }
+}
