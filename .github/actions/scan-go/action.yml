@@ -1,0 +1,159 @@
+name: scan-go
+description: >
+  Escáneres Go: gosec (SAST seguridad), govulncheck (CVE alcanzables) y
+  staticcheck (lógica / calidad). Corre una vez por cada go.mod con código y une
+  las salidas. Solo produce JSON + status.json; NUNCA falla.
+
+inputs:
+  artifact-name:
+    description: Nombre del artifact con los reportes.
+    required: false
+    default: scan-go
+  go-version:
+    required: false
+    default: "1.27"
+  gosec-version:
+    required: false
+    default: "2.30.0"
+  govulncheck-version:
+    required: false
+    default: "1.9.0"
+  staticcheck-version:
+    description: Versión del módulo honnef.co/go/tools (0.8.2 = staticcheck 2026.2.2).
+    required: false
+    default: "0.8.2"
+
+runs:
+  using: composite
+  steps:
+    # Reportes FUERA del workspace. MODULOS = directorios con go.mod y al menos un .go.
+    - id: prep
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/security-reports/go"
+        mkdir -p "$dir" "$RUNNER_TEMP/go-tools"
+        echo "$RUNNER_TEMP/go-tools" >> "$GITHUB_PATH"
+        echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"          # nunca descargar otro toolchain por go.mod
+        mods="$RUNNER_TEMP/scan-go-modulos.txt"
+        : > "$mods"
+        while IFS= read -r gomod; do
+          d=$(dirname "$gomod")
+          if find "$d" \( -name vendor -o -name testdata -o -name node_modules \) -prune \
+                 -o -type f -name '*.go' -print -quit | grep -q .; then
+            echo "${d#./}" >> "$mods"
+          fi
+        done < <(find . \( -path ./.git -o -name node_modules -o -name vendor \) -prune \
+                        -o -type f -name go.mod -print | sort)
+        echo "Módulos Go: $(paste -sd ' ' "$mods")"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        echo "modulos=$mods" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false                                    # sin caché compartida entre corridas
+
+    - name: Instalar herramientas (versiones fijas, verificadas por el sumdb de Go)
+      shell: bash
+      env:
+        GOSEC_VER: ${{ inputs.gosec-version }}
+        GOVULN_VER: ${{ inputs.govulncheck-version }}
+        SC_VER: ${{ inputs.staticcheck-version }}
+      run: |
+        export GOBIN="$RUNNER_TEMP/go-tools"
+        go install "github.com/securego/gosec/v2/cmd/gosec@v${GOSEC_VER}" \
+          || echo "::warning title=scan-go::no se pudo instalar gosec ${GOSEC_VER}"
+        go install "golang.org/x/vuln/cmd/govulncheck@v${GOVULN_VER}" \
+          || echo "::warning title=scan-go::no se pudo instalar govulncheck ${GOVULN_VER}"
+        go install "honnef.co/go/tools/cmd/staticcheck@v${SC_VER}" \
+          || echo "::warning title=scan-go::no se pudo instalar staticcheck ${SC_VER}"
+        exit 0
+
+    # Descarga dependencias (no ejecuta código del repo). Sin esto las tres fallan al cargar paquetes.
+    - name: Dependencias de cada módulo
+      shell: bash
+      env:
+        MODULOS: ${{ steps.prep.outputs.modulos }}
+      run: |
+        while IFS= read -r mod; do
+          ( cd "$mod" && go mod download ) \
+            || echo "::warning title=scan-go::go mod download falló en $mod (las herramientas pueden marcar error)"
+        done < "$MODULOS"
+        exit 0
+
+    - name: gosec
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        MODULOS: ${{ steps.prep.outputs.modulos }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: bash "$ACTION_DIR/por_modulo.sh" gosec json "0,1" gosec -fmt=json -no-fail ./...
+
+    - name: govulncheck
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        MODULOS: ${{ steps.prep.outputs.modulos }}
+        ACTION_DIR: ${{ github.action_path }}
+      # -json emite un stream de objetos; combinar.py lo convierte en arreglo. En modo
+      # -json sale con 0 aunque encuentre CVEs: cualquier otro código es error.
+      run: bash "$ACTION_DIR/por_modulo.sh" govulncheck stream "0" govulncheck -json ./...
+
+    - name: staticcheck
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+        MODULOS: ${{ steps.prep.outputs.modulos }}
+        ACTION_DIR: ${{ github.action_path }}
+      # -f json = ndjson; exit 1 = encontró problemas (válido).
+      run: bash "$ACTION_DIR/por_modulo.sh" staticcheck stream "0,1" staticcheck -f json ./...
+
+    # status.json: mismo contrato que scan-common / scan-python.
+    - name: status.json
+      if: always()
+      shell: bash
+      env:
+        OUT: ${{ steps.prep.outputs.dir }}
+      run: |
+        python3 - "$OUT" scan-go <<'PY'
+        import json, sys, pathlib
+        out, modulo = pathlib.Path(sys.argv[1]), sys.argv[2]
+        tools = []
+        for ex in sorted(out.glob("*.exit")):
+            name = ex.stem
+            code = ex.read_text().strip()
+            rep = out / f"{name}.json"
+            log = out / f"{name}.stderr.log"
+            if code == "skip":
+                estado = "omitido"
+                detalle = log.read_text(errors="replace").strip() if log.exists() else ""
+            else:
+                try:
+                    json.loads(rep.read_text(encoding="utf-8"))
+                    estado, detalle = "ok", ""
+                except FileNotFoundError:
+                    estado, detalle = "error", "la herramienta no generó su JSON"
+                except (ValueError, UnicodeDecodeError) as e:
+                    estado, detalle = "error", f"JSON inválido: {e}"
+                if estado == "error" and log.exists():
+                    detalle += " | " + log.read_text(errors="replace").strip()[-400:]
+            tools.append({"herramienta": name, "exit_code": code, "estado": estado,
+                          "detalle": detalle, "reporte": rep.name})
+        (out / "status.json").write_text(
+            json.dumps({"modulo": modulo, "herramientas": tools}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        for t in tools:
+            mark = "✓" if t["estado"] == "ok" else t["estado"].upper()
+            print(f"  {t['herramienta']:<10} {mark}  (exit {t['exit_code']})")
+            if t["estado"] == "error":
+                msg = t["detalle"].replace("\n", " ")[:200]
+                print(f"::warning title={modulo}/{t['herramienta']}::ERROR de herramienta (no bloquea): {msg}")
+        PY
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.prep.outputs.dir }}
+        retention-days: 14
+        if-no-files-found: warn

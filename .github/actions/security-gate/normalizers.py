@@ -52,6 +52,11 @@ def _nombre_pkg(nombre):
     return re.sub(r"[-_.]+", "-", nombre or "").lower()
 
 
+def _version(v):
+    """Go escribe v0.3.7; otras fuentes podrían escribir 0.3.7."""
+    return str(v or "").strip().lstrip("vV")
+
+
 def linea_de_dependencia(archivo, paquete):
     """Línea donde se declara la dependencia (para mostrarla y para saber si es nueva)."""
     if not archivo or not paquete:
@@ -203,6 +208,169 @@ def ruff(data, sev):
     return out
 
 
+# ── Utilidades Go / Node ──────────────────────────────────────────────────
+def _modulos(data):
+    """scan-go corre cada herramienta una vez por go.mod y envuelve las salidas:
+    {"modulos": [{"dir": "samples/go", "resultado": <JSON nativo>}]}."""
+    for m in (data or {}).get("modulos") or []:
+        yield (m.get("dir") or ".").replace("\\", "/").strip("/") or ".", m.get("resultado")
+
+
+def _en_modulo(modulo, ruta):
+    """Las herramientas Go reportan rutas absolutas o relativas al módulo."""
+    if not ruta:
+        return ""
+    p = str(ruta).replace("\\", "/")
+    if p.startswith("/") or re.match(r"^[A-Za-z]:/", p):
+        return ruta_relativa(p)
+    return ruta_relativa(p if modulo == "." else f"{modulo}/{p}")
+
+
+def _primera_linea(valor):
+    m = re.match(r"\s*(\d+)", str(valor or ""))
+    return int(m.group(1)) if m else None
+
+
+def _logica_o_calidad(herramienta, regla, conf, es_logica, **campos):
+    return nuevo_hallazgo(
+        herramienta=herramienta, regla=regla,
+        categoria="logica" if es_logica else "calidad", clase="logica" if es_logica else "calidad",
+        severidad=str(conf.get("logica_severidad" if es_logica else "severidad", "LOW")).upper(), **campos)
+
+
+# ── gosec ─────────────────────────────────────────────────────────────────
+def gosec(data, sev):
+    out = []
+    for modulo, r in _modulos(data):
+        for i in (r or {}).get("Issues") or []:
+            cwe = (i.get("cwe") or {}).get("id")
+            out.append(nuevo_hallazgo(
+                herramienta="gosec", regla=i.get("rule_id", ""), clase="sast",
+                severidad=severidad(sev.get("gosec"), i.get("severity")),
+                archivo=_en_modulo(modulo, i.get("file")), linea=_primera_linea(i.get("line")),
+                cwe=f"CWE-{cwe}" if cwe else "", mensaje=i.get("details", "")))
+    return out
+
+
+# ── govulncheck (solo CVE ALCANZABLES; no trae severidad) ─────────────────
+def _linea_go_mod(archivo, modulo_go):
+    if modulo_go != "stdlib":
+        return linea_de_dependencia(archivo, modulo_go)
+    try:                                         # stdlib → la directiva "go 1.x"
+        for n, linea in enumerate(Path(archivo).read_text(encoding="utf-8").splitlines(), 1):
+            if re.match(r"\s*(go|toolchain)\s+\S", linea):
+                return n
+    except OSError:
+        pass
+    return None
+
+
+def govulncheck(data, sev):
+    out = []
+    for modulo, eventos in _modulos(data):
+        osv = {e["osv"]["id"]: e["osv"] for e in eventos or [] if isinstance(e, dict) and "osv" in e}
+        vistos = set()
+        for e in eventos or []:
+            f = (e or {}).get("finding") if isinstance(e, dict) else None
+            traza = (f or {}).get("trace") or []
+            if not traza or not traza[0].get("function"):
+                continue                         # importado pero no llamado → lo cubre Trivy
+            mod, ver = traza[0].get("module", ""), traza[0].get("version", "")
+            if (f["osv"], mod) in vistos:
+                continue
+            vistos.add((f["osv"], mod))
+            meta = osv.get(f["osv"], {})
+            ids = [f["osv"]] + list(meta.get("aliases") or [])
+            cve = next((i for i in ids if i.startswith("CVE-")), ids[0])
+            go_mod = ruta_relativa("go.mod" if modulo == "." else f"{modulo}/go.mod")
+            out.append(nuevo_hallazgo(
+                herramienta="govulncheck", regla=cve, clase="cve", subtipo="dependencia",
+                severidad=severidad(sev.get("govulncheck", "MEDIUM"), None), severidad_estimada=True,
+                archivo=go_mod, linea=_linea_go_mod(go_mod, mod),
+                titulo=f"{cve} en {mod} {ver}",
+                mensaje=" ".join((meta.get("summary") or meta.get("details") or "").split())[:200]
+                        + f" (alcanzable: {traza[0].get('package', '')}.{traza[0]['function']})",
+                paquete=mod, version=ver, fix=f.get("fixed_version", ""), ids=ids))
+    return out
+
+
+# ── staticcheck (no trae severidad útil) ──────────────────────────────────
+def staticcheck(data, sev):
+    conf = sev.get("staticcheck") or {}
+    prefijos = tuple(conf.get("logica_prefijos") or ())
+    out = []
+    for modulo, items in _modulos(data):
+        for r in items or []:
+            codigo = r.get("code") or "compile"
+            loc = r.get("location") or {}
+            out.append(_logica_o_calidad(
+                "staticcheck", codigo, conf, codigo.startswith(prefijos) if prefijos else False,
+                archivo=_en_modulo(modulo, loc.get("file")), linea=loc.get("line"),
+                mensaje=r.get("message", "")))
+    return out
+
+
+# ── ESLint (una corrida; se separa por ruleId) ────────────────────────────
+_SEV_ESLINT = {2: "ERROR", 1: "WARNING"}
+
+
+def eslint(data, sev):
+    conf = sev.get("eslint") or {}
+    logica = set(conf.get("logica_reglas") or ())
+    out = []
+    for f in data or []:
+        archivo = ruta_relativa(f.get("filePath"))
+        for m in f.get("messages") or []:
+            regla = m.get("ruleId") or "parse-error"   # error de parseo: el archivo no se analizó
+            comunes = {"archivo": archivo, "linea": m.get("line"), "mensaje": m.get("message", "")}
+            if regla.startswith("security/"):
+                out.append(nuevo_hallazgo(
+                    herramienta="eslint", regla=regla, clase="sast",
+                    severidad=severidad(conf.get("seguridad"), _SEV_ESLINT.get(m.get("severity"))), **comunes))
+            else:
+                out.append(_logica_o_calidad("eslint", regla, conf, regla in logica, **comunes))
+    return out
+
+
+# ── osv-scanner (CVE npm; no trae severidad en la escala común) ──────────
+def _fix_osv(vulns, nombre):
+    fixes = []
+    for v in vulns:
+        for a in v.get("affected") or []:
+            if (a.get("package") or {}).get("name") not in (None, nombre):
+                continue
+            for r in a.get("ranges") or []:
+                fixes += [e["fixed"] for e in r.get("events") or [] if e.get("fixed")]
+    return ", ".join(dict.fromkeys(fixes))
+
+
+def osv_scanner(data, sev):
+    out = []
+    for res in (data or {}).get("results") or []:
+        archivo = ruta_relativa((res.get("source") or {}).get("path"))
+        for p in res.get("packages") or []:
+            pkg = p.get("package") or {}
+            nombre, version = pkg.get("name", ""), pkg.get("version", "")
+            por_id = {v.get("id"): v for v in p.get("vulnerabilities") or []}
+            grupos = p.get("groups") or [{"ids": [i], "aliases": []} for i in por_id]
+            for g in grupos:
+                vulns = [por_id[i] for i in g.get("ids") or [] if i in por_id]
+                ids = list(dict.fromkeys(list(g.get("ids") or []) + list(g.get("aliases") or [])
+                                         + [a for v in vulns for a in v.get("aliases") or []]))
+                if not ids:
+                    continue
+                cve = next((i for i in ids if i.startswith("CVE-")), ids[0])
+                cwes = [c for v in vulns for c in (v.get("database_specific") or {}).get("cwe_ids") or []]
+                out.append(nuevo_hallazgo(
+                    herramienta="osv-scanner", regla=cve, clase="cve", subtipo="dependencia",
+                    severidad=severidad(sev.get("osv-scanner", "MEDIUM"), None), severidad_estimada=True,
+                    archivo=archivo, linea=linea_de_dependencia(archivo, nombre),
+                    cwe=cwes[0] if cwes else "", titulo=f"{cve} en {nombre} {version}",
+                    mensaje=" ".join(((vulns[0].get("summary") or vulns[0].get("details") or "") if vulns else "").split())[:200],
+                    paquete=nombre, version=version, fix=_fix_osv(vulns, nombre), ids=ids))
+    return out
+
+
 # ── Deduplicación ─────────────────────────────────────────────────────────
 def deduplicar(hallazgos):
     """Une el mismo CVE/paquete visto por varias herramientas (Trivy + pip-audit) y el
@@ -214,7 +382,8 @@ def deduplicar(hallazgos):
         if h["clase"] == "cve":
             par = next((o for o in resultado if o["clase"] == "cve"
                         and _nombre_pkg(o["paquete"]) == _nombre_pkg(h["paquete"])
-                        and o["version"] == h["version"] and set(o["ids"]) & set(h["ids"])), None)
+                        and _version(o["version"]) == _version(h["version"])
+                        and set(o["ids"]) & set(h["ids"])), None)
         elif h["clase"] == "secreto":
             par = next((o for o in resultado if o["clase"] == "secreto" and o["archivo"] == h["archivo"]
                         and o["linea"] == h["linea"] and o["commit"] == h["commit"]), None)

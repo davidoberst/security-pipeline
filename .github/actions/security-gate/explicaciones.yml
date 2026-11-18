@@ -34,13 +34,95 @@ reglas:
     riesgo: Sin riesgo directo; a veces esconde un bug (un cálculo que se quería usar) y ensucia el código.
     arreglo: Elimina la asignación o usa la variable donde corresponda.
 
-  DS002:
+  DS002: &ds_root                # Trivy < 0.70
     titulo: El contenedor corre como root
     subtipo: configuración
     cwe: CWE-250
     que_es: El Dockerfile no define un USER distinto de root.
     riesgo: Si la app se compromete, el atacante es root dentro del contenedor y le es más fácil escalar.
     arreglo: Crea un usuario sin privilegios y agrega "USER <usuario>" al final del Dockerfile.
+  DS-0002: *ds_root              # Trivy actual (0.76) usa este id
+
+  # ── Go ────────────────────────────────────────────────────────────────
+  lab.go.command-injection: &go_cmdi
+    titulo: Command Injection
+    subtipo: inyección de comandos
+    cwe: CWE-78
+    que_es: Se arma un comando de shell (sh -c) concatenando un valor externo y se ejecuta.
+    riesgo: 'Un atacante puede encadenar comandos (p. ej. "8.8.8.8; cat /etc/passwd") y ejecutarlos en el servidor.'
+    arreglo: 'No uses la shell: exec.Command("ping", "-c", "1", host) con argumentos separados, y valida host contra una lista permitida.'
+  G702: *go_cmdi                 # gosec, análisis de flujo (taint)
+  G204:
+    titulo: Subproceso lanzado con argumentos variables
+    subtipo: inyección de comandos
+    cwe: CWE-78
+    que_es: gosec encontró un exec.Command cuyos argumentos no son constantes.
+    riesgo: Si algún argumento viene del usuario y pasa por una shell, permite ejecutar comandos arbitrarios.
+    arreglo: Usa argumentos fijos sin shell y valida los valores variables contra una lista permitida.
+  G705:
+    titulo: Posible XSS (dato externo escrito en la respuesta HTTP)
+    subtipo: XSS
+    cwe: CWE-79
+    que_es: "Un valor que llega de la petición se escribe tal cual en la respuesta ({mensaje})."
+    riesgo: Si la respuesta se muestra como HTML, un atacante puede inyectar scripts en el navegador de otro usuario.
+    arreglo: Escapa la salida (html/template) o fija Content-Type text/plain y valida el dato.
+  SA4006:
+    titulo: Valor asignado que nunca se usa
+    subtipo: bug
+    que_es: "Se asigna un valor que se sobreescribe antes de usarse ({mensaje})."
+    riesgo: Suele indicar un cálculo perdido o un error de lógica (se quería usar ese valor).
+    arreglo: Elimina la asignación sobrante o usa el valor donde corresponda.
+
+  # ── Node ──────────────────────────────────────────────────────────────
+  lab.js.eval-injection: &js_eval
+    titulo: Code Injection (eval)
+    subtipo: inyección de código
+    cwe: CWE-95
+    que_es: Se ejecuta como código (eval / new Function / vm) un valor que no es literal.
+    riesgo: Si el valor viene de afuera, el atacante ejecuta código arbitrario con los permisos del proceso Node.
+    arreglo: Elimina eval; para datos usa JSON.parse, para expresiones un parser seguro o una lista de operaciones permitidas.
+  security/detect-eval-with-expression: *js_eval
+  lab.js.command-injection: &js_cmdi
+    titulo: Command Injection
+    subtipo: inyección de comandos
+    cwe: CWE-78
+    que_es: child_process.exec/execSync recibe un comando armado con valores variables (pasa por una shell).
+    riesgo: 'Un atacante puede encadenar comandos (p. ej. "; rm -rf /") y ejecutarlos en el servidor.'
+    arreglo: 'Usa execFile/spawn con argumentos separados: execFile("ls", ["-la", dir]), y valida dir contra una lista permitida.'
+  security/detect-child-process: *js_cmdi
+  security/detect-non-literal-require:
+    titulo: require() con ruta variable
+    subtipo: inyección de código
+    cwe: CWE-94
+    que_es: Se carga un módulo cuya ruta no es constante.
+    riesgo: Si la ruta viene de afuera, se puede cargar y ejecutar código arbitrario.
+    arreglo: Usa rutas fijas o un mapa de módulos permitidos.
+  security/detect-non-literal-fs-filename:
+    titulo: Acceso a archivo con ruta variable
+    subtipo: path traversal
+    cwe: CWE-22
+    que_es: Una función de fs recibe una ruta que no es constante.
+    riesgo: 'Si la ruta viene del usuario, puede leer o escribir fuera del directorio previsto (p. ej. "../../etc/passwd").'
+    arreglo: Normaliza la ruta (path.resolve) y verifica que quede dentro del directorio permitido.
+  security/detect-unsafe-regex:
+    titulo: Expresión regular vulnerable a ReDoS
+    subtipo: denegación de servicio
+    cwe: CWE-1333
+    que_es: La regex tiene repeticiones anidadas que pueden tardar un tiempo exponencial.
+    riesgo: Un input preparado puede bloquear el event loop de Node y tumbar el servicio.
+    arreglo: Simplifica la regex (sin cuantificadores anidados) o limita el largo del input.
+  no-unreachable:
+    titulo: Código inalcanzable
+    subtipo: bug
+    que_es: "Hay código después de un return/throw que nunca se ejecuta ({mensaje})."
+    riesgo: Suele indicar un error de lógica (algo que se quería ejecutar no se ejecuta).
+    arreglo: Mueve o elimina el código inalcanzable.
+  no-undef:
+    titulo: Variable no definida
+    subtipo: bug
+    que_es: "Se usa una variable que no existe ({mensaje})."
+    riesgo: Falla en ejecución (ReferenceError) cuando se llega a esa línea.
+    arreglo: Declara la variable o corrige el nombre.
 
 cwe:
   CWE-89:
@@ -55,6 +137,30 @@ cwe:
     subtipo: inyección de código
     riesgo: Permite ejecutar código arbitrario dentro del proceso.
     arreglo: Elimina eval/exec sobre datos externos; usa un parser seguro (p. ej. json).
+  CWE-94:
+    subtipo: inyección de código
+    riesgo: Permite ejecutar código arbitrario dentro del proceso.
+    arreglo: No construyas ni cargues código a partir de datos externos; usa listas permitidas.
+  CWE-79:
+    subtipo: XSS
+    riesgo: Permite inyectar scripts que se ejecutan en el navegador de otros usuarios.
+    arreglo: Escapa toda salida con el mecanismo del framework y valida la entrada.
+  CWE-22:
+    subtipo: path traversal
+    riesgo: Permite leer o escribir archivos fuera del directorio previsto.
+    arreglo: Normaliza la ruta y verifica que quede dentro del directorio permitido.
+  CWE-295:
+    subtipo: TLS
+    riesgo: Sin validar el certificado, un atacante en la red puede interceptar y modificar el tráfico.
+    arreglo: No desactives la verificación de certificados (InsecureSkipVerify / rejectUnauthorized).
+  CWE-327:
+    subtipo: criptografía débil
+    riesgo: El algoritmo se puede romper o falsificar con recursos razonables.
+    arreglo: Usa algoritmos actuales (SHA-256+, AES-GCM) de la librería estándar.
+  CWE-1333:
+    subtipo: denegación de servicio
+    riesgo: Un input preparado puede consumir CPU y bloquear el servicio (ReDoS).
+    arreglo: Simplifica la regex o limita el largo del input.
   CWE-798:
     subtipo: secreto
     riesgo: La credencial puede ser usada por cualquiera con acceso al código o a su historial.
