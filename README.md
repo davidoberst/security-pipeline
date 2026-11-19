@@ -1,4 +1,3 @@
-
 # CI/CD Security Pipeline (DevSecOps Gate)
 
 Pipeline de seguridad en GitHub Actions que escanea cada Pull Request y bloquea el
@@ -45,17 +44,18 @@ Estas reglas definen el comportamiento y **no deben romperse** al editar:
 security-pipeline/
 ├─ .github/
 │  ├─ workflows/
-│  │  └─ security.yml                 # ORQUESTADOR: triggers, jobs, orden de ejecución
+│  │  ├─ security.yml                 # ORQUESTADOR: triggers, jobs, orden de ejecución
+│  │  └─ bypass-log.yml               # registra overrides (ver §16); dispara en PR cerrado
 │  └─ actions/                        # cada carpeta = una "composite action"
 │     ├─ detect-languages/
-│     │  └─ action.yml                # detecta Python/Go/Node por archivos marcadores
+│     │  └─ action.yml                # detecta Python/Go/Node/TS por archivos marcadores
 │     ├─ scan-common/
 │     │  ├─ action.yml                # Gitleaks + Trivy fs + Semgrep (todo repo)
 │     │  ├─ gitleaks.toml             # reglas/allowlist de secretos
 │     │  └─ semgrep-rules/            # ruleset Semgrep VERSIONADO (no se baja de internet)
 │     │     ├─ python.yml
 │     │     ├─ go.yml
-│     │     └─ js.yml
+│     │     └─ js.yml                 # cubre JavaScript Y TypeScript
 │     ├─ scan-python/
 │     │  └─ action.yml                # Bandit + pip-audit + Ruff
 │     ├─ scan-go/
@@ -68,26 +68,39 @@ security-pipeline/
 │     │     ├─ eslint.config.mjs      # config ESLint versionada
 │     │     ├─ eslint-tools.package.json       # deps de ESLint (NO es un proyecto del repo)
 │     │     └─ eslint-tools.package-lock.json  # lock con integridad
-│     └─ security-gate/
-│        ├─ action.yml                # descarga artifacts, corre gate.py, comenta el PR
-│        ├─ gate.py                   # NÚCLEO: decide y renderiza la salida
-│        ├─ normalizers.py            # JSON de cada herramienta → formato común + dedup
-│        └─ explicaciones.yml         # textos legibles por regla/CWE (qué es/riesgo/arreglo)
+│     ├─ scan-ts/
+│     │  ├─ action.yml                # ESLint (typescript-eslint, SIN type-checking) + osv-scanner
+│     │  └─ eslint/
+│     │     ├─ eslint.config.mjs      # config ESLint TS versionada
+│     │     ├─ eslint-tools.package.json       # deps de ESLint TS (NO es un proyecto del repo)
+│     │     └─ eslint-tools.package-lock.json  # lock con integridad
+│     ├─ security-gate/
+│     │  ├─ action.yml                # descarga artifacts, corre gate.py, comenta el PR
+│     │  ├─ gate.py                   # NÚCLEO: decide y renderiza la salida
+│     │  ├─ normalizers.py            # JSON de cada herramienta → formato común + dedup
+│     │  └─ explicaciones.yml         # textos legibles por regla/CWE (qué es/riesgo/arreglo)
+│     └─ bypass-log/
+│        └─ registrar.py              # arma el JSON del override (ver §16)
 ├─ gate-config/
 │  └─ policy.yml                      # severidades por herramienta, SLA, acciones
 ├─ .security-exceptions.yml           # falsos positivos / riesgos aceptados (gobernado por CODEOWNERS)
 ├─ CODEOWNERS                         # quién aprueba cambios al pipeline
+├─ bypass-log/                        # registro de overrides (un JSON por bypass; escrito por el bot)
+│  ├─ .gitkeep
+│  ├─ README.md
+│  └─ <fecha>-<commit>.json
 ├─ samples/                           # código vulnerable FICTICIO para probar
 │  ├─ python/   (vuln_sql.py, fake_secret.py, dead_code.py, requirements.txt)
 │  ├─ go/       (main.go, go.mod, go.sum)
 │  ├─ node/     (index.js, package.json, package-lock.json)
+│  ├─ ts/       (src/index.ts, package.json, package-lock.json, tsconfig.json)
 │  └─ Dockerfile.bad
 └─ README.md
 ```
 
 **Nombres a recordar:**
 - Cada módulo sube un *artifact* llamado igual que su carpeta (`scan-common`,
-  `scan-python`, `scan-go`, `scan-node`).
+  `scan-python`, `scan-go`, `scan-node`, `scan-ts`).
 - Los reportes se escriben FUERA del workspace, en
   `$RUNNER_TEMP/security-reports/<modulo>/`, para que ningún escáner lea el reporte
   de otro.
@@ -105,23 +118,27 @@ Definidos en `security.yml` → `on:`
 | `schedule` (cron `0 6 * * *`, 01:00 Colombia) | diario | igual que push; Gitleaks con historial completo |
 | `workflow_dispatch` | manual | permite forzar lenguajes y `tratar_todo_como_nuevo` (laboratorio) |
 
+> Además existe un **segundo workflow**, `bypass-log.yml`, que dispara en
+> `pull_request` **closed**. No escanea nada: solo registra un override cuando un PR
+> que el gate había bloqueado termina mergeado (ver §16).
+
 ---
 
 ## 4. Flujo de ejecución (los jobs)
 
 ```
           ┌─────────────┐
-          │   detect    │  detecta lenguajes (outputs: python/go/node/markers)
+          │   detect    │  detecta lenguajes (outputs: python/go/node/ts/markers)
           └──────┬──────┘
                  │
-     ┌───────────┼───────────────┬───────────────┐
-     ▼           ▼               ▼               ▼
-┌─────────┐ ┌──────────┐   ┌──────────┐   ┌──────────┐
-│scan-    │ │scan-     │   │scan-go   │   │scan-node │   ← continue-on-error
-│common   │ │python    │   │(si go)   │   │(si node) │     (NUNCA tumban el pipeline)
-│(siempre)│ │(si python)│  └──────────┘   └──────────┘
+     ┌───────────┼───────────────┬───────────────┬───────────────┐
+     ▼           ▼               ▼               ▼               ▼
+┌─────────┐ ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│scan-    │ │scan-     │   │scan-go   │   │scan-node │   │scan-ts   │  ← continue-on-error
+│common   │ │python    │   │(si go)   │   │(si node) │   │(si ts)   │    (NUNCA tumban el pipeline)
+│(siempre)│ │(si python)│  └──────────┘   └──────────┘   └──────────┘
 └─────────┘ └──────────┘
-     └───────────┴───────────────┴───────────────┘
+     └───────────┴───────────────┴───────────────┴───────────────┘
                  │  (cada uno sube su artifact scan-*)
                  ▼
           ┌─────────────┐
@@ -131,8 +148,8 @@ Definidos en `security.yml` → `on:`
 ```
 
 - `scan-common` **siempre** corre (no depende de `detect`).
-- `scan-python/go/node` corren solo si `detect` marcó ese lenguaje (`if:`).
-- `security-gate` tiene `needs: [detect, scan-common, scan-python, scan-go, scan-node]`
+- `scan-python/go/node/ts` corren solo si `detect` marcó ese lenguaje (`if:`).
+- `security-gate` tiene `needs: [detect, scan-common, scan-python, scan-go, scan-node, scan-ts]`
   y `if: always()`, para evaluar aunque algún escáner falle.
 - `expected-modules` (lo que el gate "esperaba" que corriera) se arma con
   `format()` a partir de los outputs de `detect`; si un módulo esperado no subió
@@ -199,6 +216,22 @@ ESLint usa `eslint.config.mjs` versionado. Las reglas `security/*` en `"error"` 
 alta señal (HIGH); en `"warn"` = más ruidosas (MEDIUM). `detect-object-injection`
 está apagada (puro ruido).
 
+### 5.5 `scan-ts` (si hay `package.json` CON `tsconfig.json`)
+`scan-node` y `scan-ts` son **mutuamente excluyentes por directorio**: con
+`tsconfig.json` → TS; sin él → Node.
+
+| Herramienta | Qué detecta | Versión |
+|---|---|---|
+| **ESLint + @typescript-eslint + eslint-plugin-security** | SAST (reglas `security/*`) + lógica/calidad sobre `.ts/.tsx/.mts/.cts`, en una corrida | fijado en `eslint-tools.package-lock.json` (parser `@typescript-eslint` 8.72.1, TS 6.0.3) |
+| **osv-scanner** | CVE de dependencias npm de los proyectos TS (lee lockfiles) | 2.7.0 |
+
+Usa el parser de TypeScript **SIN type-checking** (no hay `parserOptions.project`),
+porque eso exigiría instalar las dependencias del repo (regla de oro #6). Como no
+corre `tsc`, se reactivan a mano las reglas core de bug real (`no-unreachable`,
+`no-const-assign`, etc.) que `typescript-eslint` apaga asumiendo que el compilador
+las cubre; se dejan apagadas `no-undef`/`no-redeclare`/`no-dupe-class-members`
+(falsos positivos con tipos y overloads). Ignora `**/*.d.ts`.
+
 ---
 
 ## 6. El gate (`security-gate/gate.py`)
@@ -240,7 +273,8 @@ PR), `findings.json` (hallazgos normalizados) y `decision.json`
 Cada herramienta tiene **una función** que convierte su JSON nativo a un dict común
 vía `nuevo_hallazgo(...)`. Campos clave: `herramienta(s)`, `regla`, `severidad`,
 `archivo`, `linea`, `cwe`, `clase` (`sast`/`cve`/`secreto`/`config`/`logica`/
-`calidad`), `paquete`, `version`, `fix`, `ids`.
+`calidad`), `paquete`, `version`, `fix`, `ids`. Los normalizadores de **ESLint** y
+**osv-scanner** son compartidos por `scan-node` y `scan-ts` (mismas herramientas).
 
 `deduplicar()` une por:
 - **CVE**: mismo paquete + misma versión (comparada sin la `v` inicial que usa Go) +
@@ -258,7 +292,9 @@ Lo que ajustas **sin tocar código**:
 - `solo_nuevos: true`: solo lo nuevo bloquea.
 - `sla_dias`: plazos de backlog por severidad (7/30/90/180).
 - `severidades`: cómo se traduce la escala de **cada herramienta** a
-  CRITICAL/HIGH/MEDIUM/LOW/INFO. `_otro` = valor por defecto.
+  CRITICAL/HIGH/MEDIUM/LOW/INFO. `_otro` = valor por defecto. El bloque `eslint` es
+  compartido por Node y TS, y clasifica además las reglas `@typescript-eslint/*`
+  (bug real → MEDIUM; el resto → LOW).
 
 ### `security-gate/explicaciones.yml`
 Textos legibles (qué es / riesgo / arreglo) indexados por `regla`, por `cwe` o
@@ -304,11 +340,12 @@ Rulesets**:
   en `CODEOWNERS`.
 - **Bypass list** → "válvula de emergencia". Solo quienes estén en la lista pueden
   mergear saltándose el gate (override). El audit log de GitHub registra el bypass y
-  es inmutable.
+  es inmutable. Cada override además queda registrado automáticamente en
+  `bypass-log/` (ver §16).
 
 `CODEOWNERS` protege `.github/workflows/`, `.github/actions/`, `gate-config/`,
-`.security-exceptions.yml` y `CODEOWNERS` (hoy → `@davidoberst`; en corporativo →
-`@juanbustos67`).
+`.security-exceptions.yml`, `bypass-log/` y `CODEOWNERS` (hoy → `@davidoberst`; en
+corporativo → `@juanbustos67`).
 
 ---
 
@@ -346,7 +383,7 @@ Se le pasan `REPORTS_DIR` (carpeta con los `scan-*/status.json`), `POLICY`,
 
 ## 13. Cómo agregar un lenguaje nuevo (guía de edición)
 
-Patrón probado con Go y Node. Para un lenguaje `X`:
+Patrón probado con Go, Node y TypeScript. Para un lenguaje `X`:
 
 1. **Módulo de escaneo** — crea `.github/actions/scan-X/action.yml` copiando el
    molde de `scan-python` (el más simple): instala herramientas con **versión fija**,
@@ -372,10 +409,9 @@ Patrón probado con Go y Node. Para un lenguaje `X`:
 
 ## 14. Lenguajes
 
-- **Soportados:** Python, Go, Node (JS backend). Común a todos: secretos (Gitleaks),
-  CVE (Trivy), SAST (Semgrep).
-- **Pendientes:** TypeScript (frontend), IaC (Terraform/HCL con Checkov), Shell
-  (ShellCheck).
+- **Soportados:** Python, Go, Node (JS backend), TypeScript. Común a todos: secretos
+  (Gitleaks), CVE (Trivy), SAST (Semgrep).
+- **Pendientes:** IaC (Terraform/HCL con Checkov), Shell (ShellCheck).
 
 ---
 
@@ -387,3 +423,52 @@ Patrón probado con Go y Node. Para un lenguaje `X`:
 - **Severidad estimada:** cuando una herramienta no reporta severidad (pip-audit,
   govulncheck, osv-scanner), se usa la de Trivy para el mismo CVE; si Trivy no lo
   vio, un valor por defecto de `policy.yml`, marcado como "severidad estimada".
+
+---
+
+## 16. Registro de bypasses (`bypass-log/`)
+
+Registro automático de **overrides**: cuando un PR que el `security-gate` marcó como
+**BLOQUEADO** termina mergeado (alguien de la lista de bypass lo forzó), queda un
+archivo JSON documentándolo. **Solo** se escribe en ese caso — un merge con el gate
+en verde no genera nada.
+
+- **Quién escribe:** el bot de GitHub Actions (workflow `bypass-log.yml` →
+  `.github/actions/bypass-log/registrar.py`). Un JSON por override.
+- **Cuándo:** `pull_request` **closed** con `merged == true` **Y** el check
+  `security-gate` de ese PR estaba en `failure`.
+- **Dónde:** `bypass-log/<fecha>-<commit-corto>.json`.
+
+Esquema del JSON:
+
+```json
+{
+  "pr": 10,
+  "commit": "f3222ee",
+  "autor": "juanbustos67",
+  "bypass_por": "davidoberst",
+  "fecha": "2026-11-18",
+  "hora": "15:42:00-05:00",
+  "resultado_gate": "bloqueado",
+  "hallazgos_omitidos": [
+    {"regla": "…", "severidad": "HIGH", "archivo": "…", "linea": 17, "herramienta": "Semgrep"}
+  ],
+  "run_url": "https://github.com/…/actions/runs/…"
+}
+```
+
+- Se guardan **ambos responsables**: `autor` (quien escribió el código) y
+  `bypass_por` (quien mergeó saltándose el gate). Si son la misma persona, los dos
+  campos quedan con ese nombre.
+- `hallazgos_omitidos` = solo los hallazgos que bloqueaban (`"bloquea": true` en
+  `findings.json`).
+
+**Editabilidad:** el bot **añade** los logs automáticamente; un codeowner puede
+editarlos o verificarlos vía PR revisado (CODEOWNERS cubre `bypass-log/`). Un archivo
+en el repo **no es inmutable**: el registro realmente inmutable es el **audit log de
+GitHub**; esta carpeta es la copia **visible y accionable**.
+
+> **Config manual (no es código):** para que el bot pueda escribir en `main`, el
+> actor `github-actions[bot]` debe poder pasar la protección de rama (estar en la
+> bypass list del Ruleset). Si no, el push se rechaza y el workflow solo deja un
+> `::warning` con el contenido del JSON.
